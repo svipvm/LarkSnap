@@ -1,0 +1,54 @@
+# LarkSnap Configuration
+
+camera:
+  device_index: 0
+  width: 1280
+  height: 720
+  fps: 30
+  capture_interval: 1.0
+
+detector:
+  type: yolo_seg
+  confidence_threshold: 0.5
+  target_classes:
+    - person
+  yolo_seg:
+    model_path: models/yolo26n-seg.onnx
+    img_size: 640
+    iou_thres: 0.45
+    max_det: 300
+    provider: cpu  # cpu or cuda
+
+notifier:
+  type: feishu
+  # Webhook mode (simple, text only)
+  webhook_url: ""
+  # App mode (required for image messages)
+  app_id: ""
+  app_secret: ""
+  chat_id: ""
+  send_image: true
+  message_template: "[LarkSnap] 检测到 {label}，置信度: {confidence:.2%}，时间: {timestamp}"
+  retry:
+    max_retries: 3
+    retry_interval: 5
+
+gateway:
+  event_queue_size: 100
+  process_interval: 5.0  # seconds between detection cycles
+  detection_strategy: interval
+  notification_cooldown: 30  # seconds between same-label notifications
+  snapshot_dir: snapshots
+
+service:
+  name: LarkSnap
+  display_name: LarkSnap Detection Service
+  description: Gateway-controlled object detection system
+
+logging:
+  level: INFO
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file_path: logs/larksnap.log
+  max_bytes: 10485760
+  backup_count: 5
+  console_output: true

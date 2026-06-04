@@ -1,0 +1,11 @@
+.pytest_cache
+.ruff_cache
+.trae
+.venv
+snapshots
+logs
+tmp
+.python-version
+uv.lock
+__pycache__
+larksnap.egg-info
