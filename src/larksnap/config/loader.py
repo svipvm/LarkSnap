@@ -40,3 +40,24 @@ def load_config(config_path: str | None = None) -> AppConfig:
         return AppConfig(**raw_config)
     except Exception as e:
         raise ConfigError(f"Configuration validation failed: {e}") from e
+
+
+def save_config(config: AppConfig, config_path: str) -> None:
+    """Save application configuration to a YAML file.
+
+    Args:
+        config: AppConfig instance to save.
+        config_path: Path to the YAML configuration file.
+
+    Raises:
+        ConfigError: If writing fails.
+    """
+    path = Path(config_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        raw = config.model_dump()
+        with open(path, "w", encoding="utf-8") as f:
+            yaml.dump(raw, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+    except Exception as e:
+        raise ConfigError(f"Failed to save configuration: {e}") from e

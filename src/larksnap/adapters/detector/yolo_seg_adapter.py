@@ -90,6 +90,7 @@ class _YOLOSegWrapper:
                 else f"class_{cls_id}"
             )
             x1, y1, x2, y2 = seg_result.boxes[i]
+            mask = seg_result.masks[i] if seg_result.masks is not None and i < len(seg_result.masks) else None
             results.append(
                 DetectionResult(
                     label=label,
@@ -100,6 +101,7 @@ class _YOLOSegWrapper:
                         width=float(x2 - x1),
                         height=float(y2 - y1),
                     ),
+                    mask=mask,
                 )
             )
 

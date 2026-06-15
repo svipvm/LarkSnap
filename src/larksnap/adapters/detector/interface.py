@@ -23,6 +23,7 @@ class DetectionResult:
     label: str
     confidence: float
     bbox: BBox
+    mask: np.ndarray | None = None
 
 
 class DetectorAdapter(BaseAdapter):

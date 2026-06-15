@@ -21,12 +21,10 @@ detector:
 
 notifier:
   type: feishu
-  # Webhook mode (simple, text only)
-  webhook_url: ""
-  # App mode (required for image messages)
+  # Feishu app credentials (required)
   app_id: ""
   app_secret: ""
-  chat_id: ""
+  # chat_id is auto-detected when you send the first command to the bot
   send_image: true
   message_template: "[LarkSnap] 检测到 {label}，置信度: {confidence:.2%}，时间: {timestamp}"
   retry:
@@ -39,6 +37,13 @@ gateway:
   detection_strategy: interval
   notification_cooldown: 30  # seconds between same-label notifications
   snapshot_dir: snapshots
+  frame_queue_hwm: 30  # ZMQ high-water mark for frame queue
+  frame_queue_policy: drop_oldest  # drop_oldest, drop_newest, or block
+
+recorder:
+  output_dir: recordings
+  fps: 30.0
+  codec: mp4v
 
 service:
   name: LarkSnap

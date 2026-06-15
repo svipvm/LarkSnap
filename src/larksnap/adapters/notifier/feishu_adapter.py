@@ -1,3 +1,5 @@
+"""Feishu notifier adapter using app API for image and text messages."""
+
 import hashlib
 import logging
 import time
@@ -13,10 +15,9 @@ _FEISHU_BASE_URL = "https://open.feishu.cn/open-apis"
 
 
 class FeishuNotifierAdapter(NotifierAdapter):
-    """Feishu (Lark) notifier adapter using webhook and app API."""
+    """Feishu (Lark) notifier adapter using app API."""
 
     def __init__(self, config: NotifierConfig) -> None:
-        """Initialize the Feishu notifier with configuration."""
         self._config = config
         self._logger = logging.getLogger("larksnap.notifier.feishu")
         self._client: httpx.Client | None = None
@@ -31,11 +32,17 @@ class FeishuNotifierAdapter(NotifierAdapter):
         except Exception as e:
             raise NotifierError(f"Failed to connect to Feishu: {e}") from e
 
+    def set_chat_id(self, chat_id: str) -> None:
+        """Update the target chat ID for notifications."""
+        if chat_id and chat_id != self._config.chat_id:
+            self._config.chat_id = chat_id
+            self._logger.info("Notification target chat updated: %s", chat_id)
+
     def send_message(self, message: NotificationMessage) -> bool:
-        """Send a notification message via Feishu.
+        """Send a notification message via Feishu app API.
 
         If send_image is enabled and snapshot_path is provided, sends the
-        image to the configured chat. Otherwise falls back to webhook text.
+        image to the configured chat. Otherwise sends a text message.
         Returns False if Feishu is not configured (not an error).
         """
         if self._client is None:
@@ -44,15 +51,9 @@ class FeishuNotifierAdapter(NotifierAdapter):
             )
             return False
 
-        # Check if any Feishu channel is configured
-        has_app_creds = bool(
-            self._config.app_id and self._config.app_secret
-        )
-        has_webhook = bool(self._config.webhook_url)
-
-        if not has_app_creds and not has_webhook:
+        if not self._config.app_id or not self._config.app_secret:
             self._logger.warning(
-                "Feishu not configured (no app_id/app_secret or webhook_url), "
+                "Feishu not configured (no app_id/app_secret), "
                 "skipping notification"
             )
             return False
@@ -61,13 +62,18 @@ class FeishuNotifierAdapter(NotifierAdapter):
         if (
             self._config.send_image
             and message.snapshot_path
-            and has_app_creds
             and self._config.chat_id
         ):
             return self._send_image_message(message)
 
-        # Fallback to webhook text message
-        return self._send_webhook_text(message)
+        # Fallback to text message
+        if self._config.chat_id:
+            return self._send_text_message(message)
+
+        self._logger.warning(
+            "Feishu chat_id not configured, skipping notification"
+        )
+        return False
 
     def disconnect(self) -> None:
         """Close the HTTP client connection."""
@@ -118,7 +124,6 @@ class FeishuNotifierAdapter(NotifierAdapter):
         with open(path, "rb") as f:
             image_data = f.read()
 
-        # Calculate SHA-256 checksum for validation
         checksum = hashlib.sha256(image_data).hexdigest()
 
         resp = self._client.post(  # type: ignore[union-attr]
@@ -148,7 +153,7 @@ class FeishuNotifierAdapter(NotifierAdapter):
             image_key = self._upload_image(message.snapshot_path)  # type: ignore[arg-type]
         except NotifierError:
             self._logger.exception("Image upload failed, falling back to text")
-            return self._send_webhook_text(message)
+            return self._send_text_message(message)
 
         for attempt in range(self._config.retry.max_retries):
             try:
@@ -165,7 +170,6 @@ class FeishuNotifierAdapter(NotifierAdapter):
                 data = resp.json()
                 if data.get("code") == 0:
                     self._logger.info("Feishu image message sent successfully")
-                    # Also send a text notification as companion
                     self._send_text_to_chat(token, message)
                     return True
                 self._logger.warning(
@@ -183,6 +187,51 @@ class FeishuNotifierAdapter(NotifierAdapter):
 
         self._logger.error(
             "Feishu image message failed after %d retries",
+            self._config.retry.max_retries,
+        )
+        return False
+
+    def _send_text_message(self, message: NotificationMessage) -> bool:
+        """Send a text message to the configured Feishu chat."""
+        token = self._get_tenant_token()
+        content = self._config.message_template.format(
+            label=message.label,
+            confidence=message.confidence,
+            timestamp=message.timestamp,
+            snapshot_path=message.snapshot_path or "",
+        )
+
+        for attempt in range(self._config.retry.max_retries):
+            try:
+                resp = self._client.post(  # type: ignore[union-attr]
+                    f"{_FEISHU_BASE_URL}/im/v1/messages",
+                    headers={"Authorization": f"Bearer {token}"},
+                    params={"receive_id": self._config.chat_id},
+                    json={
+                        "receive_id": self._config.chat_id,
+                        "msg_type": "text",
+                        "content": f'{{"text": "{content}"}}',
+                    },
+                )
+                data = resp.json()
+                if data.get("code") == 0:
+                    self._logger.info("Feishu text message sent successfully")
+                    return True
+                self._logger.warning(
+                    "Feishu text message API error: %s",
+                    data.get("msg", "unknown"),
+                )
+            except httpx.RequestError as e:
+                self._logger.warning(
+                    "Feishu text message attempt %d failed: %s",
+                    attempt + 1, e,
+                )
+
+            if attempt < self._config.retry.max_retries - 1:
+                time.sleep(self._config.retry.retry_interval)
+
+        self._logger.error(
+            "Feishu text message failed after %d retries",
             self._config.retry.max_retries,
         )
         return False
@@ -210,60 +259,3 @@ class FeishuNotifierAdapter(NotifierAdapter):
             )
         except httpx.RequestError:
             self._logger.warning("Failed to send companion text message")
-
-    def _send_webhook_text(self, message: NotificationMessage) -> bool:
-        """Send a text notification via Feishu webhook."""
-        if not self._config.webhook_url:
-            self._logger.warning(
-                "Feishu webhook URL not configured, skipping notification"
-            )
-            return False
-
-        payload = self._build_webhook_payload(message)
-
-        for attempt in range(self._config.retry.max_retries):
-            try:
-                response = self._client.post(  # type: ignore[union-attr]
-                    self._config.webhook_url, json=payload
-                )
-                if response.status_code == 200:
-                    result = response.json()
-                    if result.get("code", -1) == 0:
-                        self._logger.info(
-                            "Feishu webhook notification sent successfully"
-                        )
-                        return True
-                    self._logger.warning(
-                        "Feishu API returned error: %s",
-                        result.get("msg", "unknown"),
-                    )
-                else:
-                    self._logger.warning(
-                        "Feishu API returned status %d", response.status_code
-                    )
-            except httpx.RequestError as e:
-                self._logger.warning(
-                    "Feishu notification attempt %d failed: %s", attempt + 1, e
-                )
-
-            if attempt < self._config.retry.max_retries - 1:
-                time.sleep(self._config.retry.retry_interval)
-
-        self._logger.error(
-            "Feishu notification failed after %d retries",
-            self._config.retry.max_retries,
-        )
-        return False
-
-    def _build_webhook_payload(self, message: NotificationMessage) -> dict:
-        """Build the Feishu webhook request payload from a notification message."""
-        content = self._config.message_template.format(
-            label=message.label,
-            confidence=message.confidence,
-            timestamp=message.timestamp,
-            snapshot_path=message.snapshot_path or "",
-        )
-        return {
-            "msg_type": "text",
-            "content": f'{{"text": "{content}"}}',
-        }

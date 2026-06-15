@@ -51,15 +51,22 @@ class NotifierConfig(BaseModel):
     """Notification service configuration."""
 
     type: str = "feishu"
-    webhook_url: str = ""
     app_id: str = ""
     app_secret: str = ""
-    chat_id: str = ""
+    chat_id: str = ""  # auto-detected from first command
     message_template: str = (
         "[LarkSnap] 检测到 {label}，置信度: {confidence:.2%}，时间: {timestamp}"
     )
     send_image: bool = True
     retry: RetryConfig = Field(default_factory=RetryConfig)
+
+
+class RecorderConfig(BaseModel):
+    """Video recorder configuration."""
+
+    output_dir: str = "recordings"
+    fps: float = 30.0
+    codec: str = "mp4v"
 
 
 class GatewayConfig(BaseModel):
@@ -70,6 +77,8 @@ class GatewayConfig(BaseModel):
     detection_strategy: str = "interval"
     notification_cooldown: int = 30
     snapshot_dir: str = "snapshots"
+    frame_queue_hwm: int = 30
+    frame_queue_policy: str = "drop_oldest"
 
 
 class ServiceConfig(BaseModel):
@@ -97,6 +106,7 @@ class AppConfig(BaseModel):
     camera: CameraConfig = Field(default_factory=CameraConfig)
     detector: DetectorConfig = Field(default_factory=DetectorConfig)
     notifier: NotifierConfig = Field(default_factory=NotifierConfig)
+    recorder: RecorderConfig = Field(default_factory=RecorderConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     service: ServiceConfig = Field(default_factory=ServiceConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
