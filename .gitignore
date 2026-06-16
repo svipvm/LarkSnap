@@ -9,3 +9,4 @@ tmp
 uv.lock
 __pycache__
 larksnap.egg-info
+recordings

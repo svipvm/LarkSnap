@@ -19,7 +19,7 @@ from larksnap.adapters.camera.interface import CameraAdapter
 from larksnap.adapters.camera.opencv_adapter import OpenCVCameraAdapter
 from larksnap.adapters.detector.interface import DetectionResult, DetectorAdapter
 from larksnap.adapters.detector.mock_adapter import MockDetectorAdapter
-from larksnap.adapters.detector.yolo_seg_adapter import YOLOSegDetectorAdapter
+from larksnap.adapters.detector.seg_adapter import SegDetectorAdapter
 from larksnap.adapters.notifier.feishu_adapter import FeishuNotifierAdapter
 from larksnap.adapters.notifier.feishu_ws_client import CommandHandler, FeishuWSClient
 from larksnap.adapters.notifier.interface import NotificationMessage, NotifierAdapter
@@ -34,7 +34,7 @@ from larksnap.gateway.frame_queue import (
     ResultPublisher,
     ResultSubscriber,
 )
-from larksnap.utils.exceptions import GatewayError
+from larksnap.utils.exceptions import CameraError, GatewayError
 
 
 class GatewayController:
@@ -76,6 +76,7 @@ class GatewayController:
 
         # State
         self._detection_count: int = 0
+        self._camera_failed: bool = False
         self._latest_frame: np.ndarray | None = None
         self._latest_results: list[DetectionResult] = []
         self._frame_lock = threading.Lock()
@@ -95,6 +96,10 @@ class GatewayController:
     @property
     def detection_count(self) -> int:
         return self._detection_count
+
+    @property
+    def event_bus(self) -> EventBus:
+        return self._event_bus
 
     @property
     def producer_fps(self) -> float:
@@ -119,8 +124,8 @@ class GatewayController:
         detector_type = self._config.detector.type
         if detector_type == "mock":
             return MockDetectorAdapter(self._config.detector)
-        if detector_type == "yolo_seg":
-            return YOLOSegDetectorAdapter(self._config.detector)
+        if detector_type == "seg":
+            return SegDetectorAdapter(self._config.detector)
         raise GatewayError(f"Unknown detector type: {detector_type}")
 
     def _create_notifier(self) -> NotifierAdapter:
@@ -189,7 +194,19 @@ class GatewayController:
             self._notifier = self._create_notifier()
             self._recorder = self._create_recorder()
 
-            self._camera.initialize()
+            try:
+                self._camera.initialize()
+            except CameraError as e:
+                self._logger.error("Camera initialization failed: %s", e)
+                self._event_bus.publish(Event(
+                    type=EventType.CAMERA_FAILED,
+                    data={"error": str(e), "device_index": self._config.camera.device_index},
+                    source="gateway",
+                ))
+                self._camera_failed = True
+                raise
+
+            self._camera_failed = False
             self._detector.initialize()
             self._notifier.initialize()
             self._recorder.initialize()
@@ -403,10 +420,9 @@ class GatewayController:
                 )
             )
 
-        # Save snapshot and notify
+        # Save snapshot and notify (only for labels that pass notification interval)
         frame = self.get_latest_frame()
-        snapshot_path = self._save_snapshot(frame) if frame is not None else None
-        self._notify_results(detection_results, snapshot_path)
+        self._notify_results(detection_results, frame)
 
     def _filter_results(self, results: list[DetectionResult]) -> list[DetectionResult]:
         filtered = []
@@ -437,22 +453,32 @@ class GatewayController:
             return None
 
     def _notify_results(
-        self, results: list[DetectionResult], snapshot_path: str | None = None
+        self, results: list[DetectionResult], frame: np.ndarray | None = None
     ) -> None:
         if self._notifier is None:
             return
 
         now = time.time()
-        cooldown = self._config.gateway.notification_cooldown
+        interval = self._config.gateway.notification_interval
 
+        # Collect results that pass the cooldown check
+        to_notify: list[DetectionResult] = []
         for result in results:
             last_time = self._last_notification_time.get(result.label, 0)
-            if now - last_time < cooldown:
+            if now - last_time < interval:
                 self._logger.debug(
                     "Notification for '%s' suppressed (cooldown)", result.label
                 )
                 continue
+            to_notify.append(result)
 
+        if not to_notify:
+            return
+
+        # Save snapshot once for this batch
+        snapshot_path = self._save_snapshot(frame) if frame is not None else None
+
+        for result in to_notify:
             timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             message = NotificationMessage(
                 title="LarkSnap Detection Alert",

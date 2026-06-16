@@ -6,14 +6,16 @@ camera:
   height: 720
   fps: 30
   capture_interval: 1.0
+  retry_interval: 3.0  # seconds between camera open retries
+  max_retries: 5  # max retry attempts before giving up
 
 detector:
-  type: yolo_seg
+  type: seg
   confidence_threshold: 0.5
   target_classes:
     - person
-  yolo_seg:
-    model_path: models/yolo26n-seg.onnx
+  seg:
+    model_path: models/seg-model.onnx
     img_size: 640
     iou_thres: 0.45
     max_det: 300
@@ -33,9 +35,7 @@ notifier:
 
 gateway:
   event_queue_size: 100
-  process_interval: 5.0  # seconds between detection cycles
-  detection_strategy: interval
-  notification_cooldown: 30  # seconds between same-label notifications
+  notification_interval: 1  # seconds between same-label notifications to Feishu
   snapshot_dir: snapshots
   frame_queue_hwm: 30  # ZMQ high-water mark for frame queue
   frame_queue_policy: drop_oldest  # drop_oldest, drop_newest, or block

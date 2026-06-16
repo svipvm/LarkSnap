@@ -72,7 +72,9 @@ def run_with_qt(config_path: str | None) -> None:
         window.start_preview()
         logger.info("LarkSnap started successfully")
     except Exception as e:
-        logger.error("Failed to start: %s", e)
+        logger.error("Failed to auto-start: %s", e)
+        # Camera failure is handled by event bus → QMessageBox
+        # Other errors: just show the window in stopped state
 
     window.show()
 

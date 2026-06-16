@@ -13,6 +13,7 @@ class EventType(str, Enum):
     DETECTION_COMPLETED = "detection_completed"
     NOTIFICATION_SENT = "notification_sent"
     ERROR_OCCURRED = "error_occurred"
+    CAMERA_FAILED = "camera_failed"
     SYSTEM_STARTED = "system_started"
     SYSTEM_STOPPED = "system_stopped"
 

@@ -9,6 +9,8 @@ class CameraConfig(BaseModel):
     height: int = 720
     fps: int = 30
     capture_interval: float = 1.0
+    retry_interval: float = 3.0
+    max_retries: int = 5
 
 
 class MockDetectorConfig(BaseModel):
@@ -19,10 +21,10 @@ class MockDetectorConfig(BaseModel):
     delay_seconds: float = 0.1
 
 
-class YOLOSegConfig(BaseModel):
-    """YOLO Segmentation ONNX Runtime detector configuration."""
+class SegConfig(BaseModel):
+    """Instance Segmentation ONNX Runtime detector configuration."""
 
-    model_path: str = "models/yolo26n-seg.onnx"
+    model_path: str = "models/seg-model.onnx"
     img_size: int = 640
     iou_thres: float = 0.45
     max_det: int = 300
@@ -32,12 +34,12 @@ class YOLOSegConfig(BaseModel):
 class DetectorConfig(BaseModel):
     """AI detector configuration."""
 
-    type: str = "yolo_seg"
+    type: str = "seg"
     model_path: str = ""
     confidence_threshold: float = 0.5
     target_classes: list[str] = Field(default_factory=lambda: ["person"])
     mock: MockDetectorConfig = Field(default_factory=MockDetectorConfig)
-    yolo_seg: YOLOSegConfig = Field(default_factory=YOLOSegConfig)
+    seg: SegConfig = Field(default_factory=SegConfig)
 
 
 class RetryConfig(BaseModel):
@@ -73,9 +75,7 @@ class GatewayConfig(BaseModel):
     """Gateway controller configuration."""
 
     event_queue_size: int = 100
-    process_interval: float = 5.0
-    detection_strategy: str = "interval"
-    notification_cooldown: int = 30
+    notification_interval: int = 30
     snapshot_dir: str = "snapshots"
     frame_queue_hwm: int = 30
     frame_queue_policy: str = "drop_oldest"

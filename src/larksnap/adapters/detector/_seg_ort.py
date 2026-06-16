@@ -1,7 +1,7 @@
-"""YOLO Segmentation ONNX Runtime inference module.
+"""Instance Segmentation ONNX Runtime inference module.
 
 Based on onnxruntime, supports both end-to-end (built-in NMS) and standard
-(manual NMS) ONNX export formats for YOLO instance segmentation models.
+(manual NMS) ONNX export formats for instance segmentation models.
 """
 
 from __future__ import annotations
@@ -53,7 +53,7 @@ class SegResult:
 class InferConfig:
     """Inference configuration."""
 
-    model_path: str = "yolo26n-seg.onnx"
+    model_path: str = "seg-model.onnx"
     img_size: int = 640
     conf_thres: float = 0.25
     iou_thres: float = 0.45
@@ -64,8 +64,8 @@ class InferConfig:
     )
 
 
-class YOLOSegORT:
-    """YOLO Segmentation ONNX Runtime predictor.
+class SegORT:
+    """Instance Segmentation ONNX Runtime predictor.
 
     Auto-detects model output format:
       - end-to-end: output0 (1, 300, 4+1+1+32) with built-in NMS
@@ -111,7 +111,7 @@ class YOLOSegORT:
         dropped = set(requested) - set(providers)
         if dropped:
             import logging
-            logging.getLogger("larksnap.detector.yolo_seg").warning(
+            logging.getLogger("larksnap.detector.seg").warning(
                 "ONNX Runtime providers %s not available, using %s",
                 dropped, providers,
             )
@@ -322,7 +322,7 @@ class YOLOSegORT:
             if len(order) == 1:
                 break
             remaining = order[1:]
-            ious = YOLOSegORT._box_iou(
+            ious = SegORT._box_iou(
                 boxes[i : i + 1], boxes[remaining]
             )[0]
             same_class = class_ids[remaining] == class_ids[i]
@@ -353,6 +353,7 @@ class YOLOSegORT:
         c, mh, mw = protos.shape
         masks = (mask_coefs @ protos.reshape(c, -1)).reshape(-1, mh, mw)
 
+        # Crop masks using letterbox-space boxes
         width_ratio = mw / self.cfg.img_size
         height_ratio = mh / self.cfg.img_size
         scaled_boxes = boxes_xyxy * np.array(
@@ -360,19 +361,23 @@ class YOLOSegORT:
         )
         masks = self._crop_mask(masks, scaled_boxes)
 
+        # Threshold
+        masks = (masks > self.cfg.mask_threshold).astype(np.float32)
+
+        # Resize masks to original image shape
         if masks.shape[1:] != orig_shape:
             masks_resized = np.zeros(
                 (len(masks), *orig_shape), dtype=np.float32
             )
             for i in range(len(masks)):
                 masks_resized[i] = cv2.resize(
-                    masks[i].astype(np.float32),
+                    masks[i],
                     (orig_shape[1], orig_shape[0]),
                     interpolation=cv2.INTER_LINEAR,
                 )
             masks = masks_resized
 
-        masks = (masks > self.cfg.mask_threshold).astype(np.uint8)
+        masks = (masks > 0.5).astype(np.uint8)
         return masks
 
     @staticmethod

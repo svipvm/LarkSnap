@@ -1,7 +1,7 @@
-"""YOLO Segmentation ONNX Runtime detector adapter.
+"""Instance Segmentation ONNX Runtime detector adapter.
 
-Wraps the YOLOSegORT inference engine to implement the DetectorAdapter interface,
-providing person detection capabilities using YOLO segmentation models.
+Wraps the SegORT inference engine to implement the DetectorAdapter interface,
+providing object detection capabilities using instance segmentation models.
 """
 
 from __future__ import annotations
@@ -15,68 +15,68 @@ from larksnap.config.models import DetectorConfig
 from larksnap.utils.exceptions import DetectorError
 
 
-class YOLOSegDetectorAdapter(DetectorAdapter):
-    """Detector adapter using YOLO Segmentation ONNX Runtime inference."""
+class SegDetectorAdapter(DetectorAdapter):
+    """Detector adapter using Instance Segmentation ONNX Runtime inference."""
 
     def __init__(self, config: DetectorConfig) -> None:
         self._config = config
-        self._logger = logging.getLogger("larksnap.detector.yolo_seg")
-        self._predictor: _YOLOSegWrapper | None = None
+        self._logger = logging.getLogger("larksnap.detector.seg")
+        self._predictor: _SegWrapper | None = None
 
     def load_model(self) -> None:
         try:
-            self._predictor = _YOLOSegWrapper(self._config)
+            self._predictor = _SegWrapper(self._config)
             self._logger.info(
-                "YOLO Seg model loaded: %s", self._config.yolo_seg.model_path
+                "Seg model loaded: %s", self._config.seg.model_path
             )
         except Exception as e:
-            raise DetectorError(f"Failed to load YOLO Seg model: {e}") from e
+            raise DetectorError(f"Failed to load seg model: {e}") from e
 
     def detect(self, frame: np.ndarray) -> list[DetectionResult]:
         if self._predictor is None:
-            raise DetectorError("YOLO Seg model not loaded")
+            raise DetectorError("Seg model not loaded")
 
         try:
             return self._predictor.predict(frame)
         except Exception as e:
-            raise DetectorError(f"YOLO Seg detection failed: {e}") from e
+            raise DetectorError(f"Seg detection failed: {e}") from e
 
     def unload_model(self) -> None:
         self._predictor = None
-        self._logger.info("YOLO Seg model unloaded")
+        self._logger.info("Seg model unloaded")
 
 
-class _YOLOSegWrapper:
-    """Thin wrapper around YOLOSegORT that converts SegResult to DetectionResult."""
+class _SegWrapper:
+    """Thin wrapper around SegORT that converts SegResult to DetectionResult."""
 
     # COCO class id for "person"
     _PERSON_CLASS_ID = 0
 
     def __init__(self, config: DetectorConfig) -> None:
-        from larksnap.adapters.detector._yolo_seg_ort import (
+        from larksnap.adapters.detector._seg_ort import (
             COCO_NAMES,
             InferConfig,
-            YOLOSegORT,
+            SegORT,
         )
 
         self._coco_names = COCO_NAMES
-        yolo_cfg = config.yolo_seg
+        seg_cfg = config.seg
 
         providers: list[str] = []
-        if yolo_cfg.provider == "cuda":
+        if seg_cfg.provider == "cuda":
             providers.extend(["CUDAExecutionProvider", "CPUExecutionProvider"])
         else:
             providers.append("CPUExecutionProvider")
 
         infer_config = InferConfig(
-            model_path=yolo_cfg.model_path,
-            img_size=yolo_cfg.img_size,
+            model_path=seg_cfg.model_path,
+            img_size=seg_cfg.img_size,
             conf_thres=config.confidence_threshold,
-            iou_thres=yolo_cfg.iou_thres,
-            max_det=yolo_cfg.max_det,
+            iou_thres=seg_cfg.iou_thres,
+            max_det=seg_cfg.max_det,
             providers=providers,
         )
-        self._ort = YOLOSegORT(infer_config)
+        self._ort = SegORT(infer_config)
 
     def predict(self, frame: np.ndarray) -> list[DetectionResult]:
         seg_result = self._ort.predict(frame)

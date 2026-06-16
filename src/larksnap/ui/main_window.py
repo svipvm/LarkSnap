@@ -1,19 +1,17 @@
-"""LarkSnap main window with PySide6 — dynamic, animated dark-themed UI.
+"""LarkSnap main window with PySide6 — immersive video-centric UI.
 
-Provides real-time camera preview, detection overlay with masks,
-configuration dialog, recording controls, and animated status display.
+Main page is full video stream only. All controls, stats, and settings
+are accessed through the navigation menu bar.
 """
 
 from __future__ import annotations
 
 import logging
-import time
 
 import cv2
 import numpy as np
 from PySide6.QtCore import (
     QEasingCurve,
-    QPoint,
     QPropertyAnimation,
     QRect,
     QSize,
@@ -22,14 +20,14 @@ from PySide6.QtCore import (
     Signal,
 )
 from PySide6.QtGui import (
+    QAction,
     QColor,
     QFont,
     QIcon,
     QImage,
     QKeyEvent,
-    QPaintEvent,
+    QMouseEvent,
     QPainter,
-    QPen,
     QPixmap,
 )
 from PySide6.QtWidgets import (
@@ -37,7 +35,6 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDoubleSpinBox,
-    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -45,13 +42,11 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMenu,
-    QMenuBar,
     QMessageBox,
     QPushButton,
-    QScrollArea,
-    QSlider,
     QSpinBox,
     QStatusBar,
+    QSystemTrayIcon,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -61,6 +56,7 @@ from larksnap.adapters.detector.interface import DetectionResult
 from larksnap.config.loader import save_config
 from larksnap.config.models import AppConfig
 from larksnap.gateway.controller import GatewayController
+from larksnap.gateway.event_bus import Event, EventType
 
 # ─── Global Stylesheet ───────────────────────────────────────────────
 
@@ -111,29 +107,43 @@ QPushButton:disabled {
     color: #555566;
     border-color: #1a1a2a;
 }
-QPushButton:checked {
-    background-color: #3a3a5e;
-    border-color: #6a6aae;
-}
 QStatusBar {
-    background-color: #0a0a14;
-    color: #666688;
-    border-top: 1px solid #1a1a2e;
-    font-size: 12px;
+    background-color: transparent;
+    color: #555570;
+    font-size: 11px;
 }
 QMenuBar {
-    background-color: #0a0a14;
+    background-color: rgba(15, 15, 26, 200);
     border-bottom: 1px solid #1a1a2e;
+    spacing: 4px;
+    padding: 2px;
+}
+QMenuBar::item {
+    padding: 6px 14px;
+    border-radius: 4px;
+    color: #8888aa;
 }
 QMenuBar::item:selected {
     background-color: #1e1e32;
+    color: #ffffff;
 }
 QMenu {
     background-color: #14141e;
     border: 1px solid #2a2a3e;
+    border-radius: 8px;
+    padding: 4px;
+}
+QMenu::item {
+    padding: 7px 28px 7px 16px;
+    border-radius: 4px;
 }
 QMenu::item:selected {
     background-color: #2a2a44;
+}
+QMenu::separator {
+    height: 1px;
+    background: #2a2a3e;
+    margin: 4px 8px;
 }
 QTabWidget::pane {
     border: 1px solid #2a2a3e;
@@ -164,21 +174,6 @@ QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
 QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {
     border-color: #6a6aae;
 }
-QSlider::groove:horizontal {
-    height: 6px;
-    background: #1a1a2e;
-    border-radius: 3px;
-}
-QSlider::handle:horizontal {
-    background: #6a6aae;
-    width: 16px;
-    margin: -5px 0;
-    border-radius: 8px;
-}
-QSlider::sub-page:horizontal {
-    background: #4a4a8e;
-    border-radius: 3px;
-}
 QCheckBox::indicator {
     width: 16px;
     height: 16px;
@@ -190,89 +185,67 @@ QCheckBox::indicator:checked {
     background-color: #6a6aae;
     border-color: #6a6aae;
 }
-QScrollArea {
-    border: none;
-    background-color: transparent;
-}
 """
 
 
-# ─── Animated Pulse Widget ────────────────────────────────────────────
-
-class PulseWidget(QWidget):
-    """A widget that draws an animated pulsing circle (for recording indicator)."""
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self._opacity = 0.0
-        self._target_opacity = 0.0
-        self.setFixedSize(20, 20)
-
-    def set_active(self, active: bool) -> None:
-        self._target_opacity = 1.0 if active else 0.0
-        self.update()
-
-    def set_opacity(self, opacity: float) -> None:
-        self._opacity = opacity
-        self.update()
-
-    def get_opacity(self) -> float:
-        return self._opacity
-
-    opacity = property(get_opacity, set_opacity)
-
-    def paintEvent(self, event: QPaintEvent) -> None:
-        if self._opacity < 0.01:
-            return
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-        color = QColor(231, 76, 60, int(self._opacity * 255))
-        painter.setBrush(color)
-        painter.setPen(Qt.NoPen)
-        painter.drawEllipse(2, 2, 16, 16)
-        # Glow
-        glow = QColor(231, 76, 60, int(self._opacity * 80))
-        painter.setBrush(glow)
-        painter.drawEllipse(0, 0, 20, 20)
-        painter.end()
-
-
-# ─── Video Preview ────────────────────────────────────────────────────
+# ─── Video Preview (Full-screen immersive) ────────────────────────────
 
 class VideoPreviewWidget(QWidget):
-    """Real-time camera preview with detection bounding box and mask overlay."""
+    """Full-area video preview with detection overlay and floating HUD."""
 
     _PALETTE = np.random.RandomState(42).randint(50, 255, size=(80, 3), dtype=np.uint8)
     _MASK_ALPHA = 0.45
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._image_label = QLabel()
-        self._image_label.setAlignment(Qt.AlignCenter)
-        self._image_label.setMinimumSize(640, 480)
-        self._image_label.setStyleSheet(
-            "background-color: #0a0a14; border-radius: 8px; border: 1px solid #1a1a2e;"
-        )
+        self._pixmap: QPixmap | None = None
+        self._fps: float = 0.0
+        self._detection_count: int = 0
+        self._is_recording: bool = False
+        self._is_running: bool = False
+        self._is_paused: bool = False
+        self._rec_pulse_phase: float = 0.0
+        self._show_hud: bool = True
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self._image_label)
+        # HUD auto-hide timer
+        self._hud_timer = QTimer(self)
+        self._hud_timer.setInterval(3000)
+        self._hud_timer.setSingleShot(True)
+        self._hud_timer.timeout.connect(self._hide_hud)
 
-    @classmethod
-    def _get_class_color(cls, label: str) -> np.ndarray:
-        idx = hash(label) % len(cls._PALETTE)
-        return cls._PALETTE[idx]
+        self.setMouseTracking(True)
+
+    def show_hud_temporarily(self) -> None:
+        """Show HUD and auto-hide after timeout."""
+        self._show_hud = True
+        self._hud_timer.start()
+        self.update()
+
+    def _hide_hud(self) -> None:
+        self._show_hud = False
+        self.update()
 
     def update_frame(self, frame: np.ndarray, results: list[DetectionResult] | None = None) -> None:
         display = frame.copy()
 
         if results:
             overlay = display.copy()
+            fh, fw = display.shape[:2]
             for result in results:
                 if result.mask is not None and result.mask.size > 0:
+                    mask = result.mask
+                    mh, mw = mask.shape[:2]
+                    # Resize mask to match frame if dimensions differ
+                    if mh != fh or mw != fw:
+                        mask = cv2.resize(
+                            mask.astype(np.float32),
+                            (fw, fh),
+                            interpolation=cv2.INTER_NEAREST,
+                        )
+                        mask = (mask > 0.5).astype(np.uint8)
                     color = self._get_class_color(result.label)
                     colored_mask = np.zeros_like(display)
-                    colored_mask[result.mask > 0] = color
+                    colored_mask[mask > 0] = color
                     cv2.addWeighted(colored_mask, self._MASK_ALPHA, overlay, 1, 0, overlay)
             cv2.addWeighted(overlay, self._MASK_ALPHA, display, 1 - self._MASK_ALPHA, 0, display)
 
@@ -295,76 +268,92 @@ class VideoPreviewWidget(QWidget):
             qimage = QImage(display.data, w, h, 3 * w, QImage.Format_RGB888).rgbSwapped()
         else:
             qimage = QImage(display.data, w, h, w, QImage.Format_Grayscale8)
+        self._pixmap = QPixmap.fromImage(qimage)
+        self.update()
 
-        pixmap = QPixmap.fromImage(qimage)
-        scaled = pixmap.scaled(self._image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        self._image_label.setPixmap(scaled)
+    def update_hud(self, fps: float, detection_count: int, running: bool, paused: bool, recording: bool) -> None:
+        self._fps = fps
+        self._detection_count = detection_count
+        self._is_running = running
+        self._is_paused = paused
+        self._is_recording = recording
+        if recording:
+            self._rec_pulse_phase = (self._rec_pulse_phase + 0.1) % (2 * 3.14159)
+        self.update()
+
+    @classmethod
+    def _get_class_color(cls, label: str) -> np.ndarray:
+        idx = hash(label) % len(cls._PALETTE)
+        return cls._PALETTE[idx]
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        # Draw video frame scaled to fill
+        if self._pixmap:
+            scaled = self._pixmap.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            x = (self.width() - scaled.width()) // 2
+            y = (self.height() - scaled.height()) // 2
+            painter.drawPixmap(x, y, scaled)
+        else:
+            painter.fillRect(self.rect(), QColor("#0a0a14"))
+            painter.setPen(QColor("#333355"))
+            painter.setFont(QFont("Segoe UI", 16))
+            painter.drawText(self.rect(), Qt.AlignCenter, "No Signal")
+
+        # Draw floating HUD overlay
+        if self._show_hud:
+            self._draw_hud(painter)
+
+        painter.end()
+
+    def _draw_hud(self, painter: QPainter) -> None:
+        """Draw semi-transparent HUD in corners."""
+        w, h = self.width(), self.height()
+
+        # Top-left: status + FPS
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 120))
+        painter.drawRoundedRect(12, 12, 200, 50, 8, 8)
+
+        painter.setFont(QFont("Segoe UI", 11))
+        if self._is_running:
+            status_text = "PAUSED" if self._is_paused else "RUNNING"
+            status_color = QColor("#f39c12") if self._is_paused else QColor("#2ecc71")
+        else:
+            status_text = "STOPPED"
+            status_color = QColor("#888899")
+
+        painter.setPen(status_color)
+        painter.drawText(22, 34, f"● {status_text}")
+        painter.setPen(QColor("#c0c0d0"))
+        painter.setFont(QFont("Segoe UI", 10))
+        painter.drawText(22, 52, f"FPS: {self._fps:.1f}")
+
+        # Top-right: recording indicator
+        if self._is_recording:
+            import math
+            alpha = int(128 + 127 * math.sin(self._rec_pulse_phase))
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(0, 0, 0, 120))
+            painter.drawRoundedRect(w - 110, 12, 98, 34, 8, 8)
+            painter.setBrush(QColor(231, 76, 60, alpha))
+            painter.drawEllipse(w - 96, 20, 14, 14)
+            painter.setPen(QColor("#e74c3c"))
+            painter.setFont(QFont("Segoe UI", 10, QFont.Bold))
+            painter.drawText(w - 78, 34, "REC")
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        """Show HUD on mouse move."""
+        self.show_hud_temporarily()
+        super().mouseMoveEvent(event)
 
 
-# ─── Animated Button ──────────────────────────────────────────────────
+# ─── Control Dialog ───────────────────────────────────────────────────
 
-class AnimatedButton(QPushButton):
-    """QPushButton with scale animation on click."""
-
-    def __init__(self, text: str = "", parent: QWidget | None = None) -> None:
-        super().__init__(text, parent)
-        self._anim = QPropertyAnimation(self, b"geometry")
-        self._anim.setDuration(120)
-        self._anim.setEasingCurve(QEasingCurve.OutCubic)
-
-    def mousePressEvent(self, event) -> None:
-        geo = self.geometry()
-        shrink = QRect(geo.x() + 2, geo.y() + 2, geo.width() - 4, geo.height() - 4)
-        self._anim.setStartValue(shrink)
-        self._anim.setEndValue(geo)
-        self._anim.start()
-        super().mousePressEvent(event)
-
-
-# ─── Status Badge ─────────────────────────────────────────────────────
-
-class StatusBadge(QLabel):
-    """Animated status badge with color transitions."""
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self._status = "stopped"
-        self.setFixedHeight(28)
-        self.setAlignment(Qt.AlignCenter)
-        self._update_style()
-
-    def set_status(self, status: str) -> None:
-        if status == self._status:
-            return
-        self._status = status
-        # Fade animation
-        self._anim = QPropertyAnimation(self, b"windowOpacity")
-        self._anim.setDuration(300)
-        self._anim.setStartValue(0.3)
-        self._anim.setEndValue(1.0)
-        self._anim.setEasingCurve(QEasingCurve.OutCubic)
-        self._anim.start()
-        self._update_style()
-
-    def _update_style(self) -> None:
-        colors = {
-            "running": ("#2ecc71", "#0f2e1a", "Running"),
-            "paused": ("#f39c12", "#2e2a0f", "Paused"),
-            "stopped": ("#888899", "#1a1a22", "Stopped"),
-            "recording": ("#e74c3c", "#2e0f0f", "Recording"),
-        }
-        fg, bg, text = colors.get(self._status, colors["stopped"])
-        self.setText(f"  {text}  ")
-        self.setStyleSheet(
-            f"background-color: {bg}; color: {fg}; border: 1px solid {fg}; "
-            f"border-radius: 14px; font-weight: bold; font-size: 12px; padding: 2px 12px;"
-        )
-
-
-# ─── Control Panel ────────────────────────────────────────────────────
-
-class ControlPanel(QWidget):
-    """Control panel with animated buttons and recording pulse indicator."""
+class ControlDialog(QDialog):
+    """Floating control panel as a dialog, accessible from menu."""
 
     start_requested = Signal()
     stop_requested = Signal()
@@ -375,68 +364,67 @@ class ControlPanel(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.setWindowTitle("Controls")
+        self.setFixedSize(280, 240)
+        self.setStyleSheet(DARK_STYLE)
+        self.setWindowFlags(Qt.Tool | Qt.WindowStaysOnTopHint)
+
         self._is_running = False
         self._is_paused = False
         self._is_recording = False
 
-        # Detection controls
-        detection_group = QGroupBox("Detection")
-        detection_layout = QHBoxLayout(detection_group)
-        detection_layout.setSpacing(8)
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
 
-        self._start_btn = AnimatedButton("Start")
+        # Detection
+        det_group = QGroupBox("Detection")
+        det_layout = QHBoxLayout(det_group)
+        det_layout.setSpacing(6)
+
+        self._start_btn = QPushButton("Start")
         self._start_btn.setStyleSheet(
-            "QPushButton { background-color: #1a3a2a; border-color: #2ecc71; color: #2ecc71; }"
-            "QPushButton:hover { background-color: #2ecc71; color: #ffffff; }"
+            "QPushButton{background:#1a3a2a;border-color:#2ecc71;color:#2ecc71}"
+            "QPushButton:hover{background:#2ecc71;color:#fff}"
         )
-        self._start_btn.clicked.connect(self._on_start)
+        self._start_btn.clicked.connect(self.start_requested.emit)
 
-        self._stop_btn = AnimatedButton("Stop")
+        self._stop_btn = QPushButton("Stop")
         self._stop_btn.setStyleSheet(
-            "QPushButton { background-color: #3a1a1a; border-color: #e74c3c; color: #e74c3c; }"
-            "QPushButton:hover { background-color: #e74c3c; color: #ffffff; }"
+            "QPushButton{background:#3a1a1a;border-color:#e74c3c;color:#e74c3c}"
+            "QPushButton:hover{background:#e74c3c;color:#fff}"
         )
-        self._stop_btn.clicked.connect(self._on_stop)
+        self._stop_btn.clicked.connect(self.stop_requested.emit)
         self._stop_btn.setEnabled(False)
 
-        self._pause_btn = AnimatedButton("Pause")
+        self._pause_btn = QPushButton("Pause")
         self._pause_btn.setStyleSheet(
-            "QPushButton { background-color: #3a2e1a; border-color: #f39c12; color: #f39c12; }"
-            "QPushButton:hover { background-color: #f39c12; color: #ffffff; }"
+            "QPushButton{background:#3a2e1a;border-color:#f39c12;color:#f39c12}"
+            "QPushButton:hover{background:#f39c12;color:#fff}"
         )
         self._pause_btn.clicked.connect(self._on_pause)
         self._pause_btn.setEnabled(False)
 
-        detection_layout.addWidget(self._start_btn)
-        detection_layout.addWidget(self._stop_btn)
-        detection_layout.addWidget(self._pause_btn)
+        det_layout.addWidget(self._start_btn)
+        det_layout.addWidget(self._stop_btn)
+        det_layout.addWidget(self._pause_btn)
 
-        # Recording controls
-        recording_group = QGroupBox("Recording")
-        recording_layout = QHBoxLayout(recording_group)
-        recording_layout.setSpacing(8)
+        # Recording
+        rec_group = QGroupBox("Recording")
+        rec_layout = QHBoxLayout(rec_group)
 
-        self._record_btn = AnimatedButton("Record")
+        self._record_btn = QPushButton("Record")
         self._record_btn.setStyleSheet(
-            "QPushButton { background-color: #3a1a1a; border-color: #e74c3c; color: #e74c3c; }"
-            "QPushButton:hover { background-color: #e74c3c; color: #ffffff; }"
+            "QPushButton{background:#3a1a1a;border-color:#e74c3c;color:#e74c3c}"
+            "QPushButton:hover{background:#e74c3c;color:#fff}"
         )
         self._record_btn.clicked.connect(self._on_record_toggle)
         self._record_btn.setEnabled(False)
 
-        self._pulse = PulseWidget()
-        self._rec_label = QLabel("")
-        self._rec_label.setStyleSheet("color: #e74c3c; font-weight: bold; font-size: 13px;")
+        rec_layout.addWidget(self._record_btn)
 
-        recording_layout.addWidget(self._record_btn)
-        recording_layout.addWidget(self._pulse)
-        recording_layout.addWidget(self._rec_label)
-        recording_layout.addStretch()
-
-        layout = QVBoxLayout(self)
-        layout.setSpacing(6)
-        layout.addWidget(detection_group)
-        layout.addWidget(recording_group)
+        layout.addWidget(det_group)
+        layout.addWidget(rec_group)
+        layout.addStretch()
 
     def set_running(self, running: bool) -> None:
         self._is_running = running
@@ -449,8 +437,6 @@ class ControlPanel(QWidget):
             self._is_recording = False
             self._pause_btn.setText("Pause")
             self._record_btn.setText("Record")
-            self._pulse.set_active(False)
-            self._rec_label.setText("")
 
     def set_paused(self, paused: bool) -> None:
         self._is_paused = paused
@@ -458,15 +444,7 @@ class ControlPanel(QWidget):
 
     def set_recording(self, recording: bool) -> None:
         self._is_recording = recording
-        self._record_btn.setText("Stop" if recording else "Record")
-        self._pulse.set_active(recording)
-        self._rec_label.setText("REC" if recording else "")
-
-    def _on_start(self) -> None:
-        self.start_requested.emit()
-
-    def _on_stop(self) -> None:
-        self.stop_requested.emit()
+        self._record_btn.setText("Stop Rec" if recording else "Record")
 
     def _on_pause(self) -> None:
         if self._is_paused:
@@ -481,56 +459,53 @@ class ControlPanel(QWidget):
             self.start_recording_requested.emit()
 
 
-# ─── Stats Panel ──────────────────────────────────────────────────────
+# ─── Stats Dialog ─────────────────────────────────────────────────────
 
-class StatsPanel(QWidget):
-    """Animated stats panel with live counters."""
+class StatsDialog(QDialog):
+    """Statistics display as a floating dialog."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.setWindowTitle("Statistics")
+        self.setFixedSize(240, 200)
+        self.setStyleSheet(DARK_STYLE)
+        self.setWindowFlags(Qt.Tool | Qt.WindowStaysOnTopHint)
 
-        group = QGroupBox("Statistics")
-        layout = QGridLayout(group)
-        layout.setSpacing(6)
+        layout = QVBoxLayout(self)
+        group = QGroupBox("Live Stats")
+        grid = QGridLayout(group)
+        grid.setSpacing(6)
 
-        self._status_badge = StatusBadge()
-        self._fps_value = self._make_stat_value("0.0")
-        self._fps_label = self._make_stat_label("FPS")
-        self._det_value = self._make_stat_value("0")
-        self._det_label = self._make_stat_label("Detections")
-        self._rec_value = self._make_stat_value("Off")
-        self._rec_label = self._make_stat_label("Recording")
+        self._fps_val = QLabel("0.0")
+        self._fps_val.setStyleSheet("font-size:18px;font-weight:bold;color:#fff")
+        self._fps_lbl = QLabel("FPS")
+        self._fps_lbl.setStyleSheet("font-size:11px;color:#666688")
 
-        layout.addWidget(self._status_badge, 0, 0, 1, 2)
-        layout.addWidget(self._fps_value, 1, 0)
-        layout.addWidget(self._fps_label, 1, 1)
-        layout.addWidget(self._det_value, 2, 0)
-        layout.addWidget(self._det_label, 2, 1)
-        layout.addWidget(self._rec_value, 3, 0)
-        layout.addWidget(self._rec_label, 3, 1)
+        self._det_val = QLabel("0")
+        self._det_val.setStyleSheet("font-size:18px;font-weight:bold;color:#fff")
+        self._det_lbl = QLabel("Detections")
+        self._det_lbl.setStyleSheet("font-size:11px;color:#666688")
 
-        main_layout = QVBoxLayout(self)
-        main_layout.addWidget(group)
+        self._rec_val = QLabel("Off")
+        self._rec_val.setStyleSheet("font-size:18px;font-weight:bold;color:#888899")
+        self._rec_lbl = QLabel("Recording")
+        self._rec_lbl.setStyleSheet("font-size:11px;color:#666688")
 
-    @staticmethod
-    def _make_stat_value(text: str) -> QLabel:
-        lbl = QLabel(text)
-        lbl.setStyleSheet("font-size: 18px; font-weight: bold; color: #ffffff;")
-        return lbl
+        grid.addWidget(self._fps_val, 0, 0)
+        grid.addWidget(self._fps_lbl, 0, 1)
+        grid.addWidget(self._det_val, 1, 0)
+        grid.addWidget(self._det_lbl, 1, 1)
+        grid.addWidget(self._rec_val, 2, 0)
+        grid.addWidget(self._rec_lbl, 2, 1)
 
-    @staticmethod
-    def _make_stat_label(text: str) -> QLabel:
-        lbl = QLabel(text)
-        lbl.setStyleSheet("font-size: 11px; color: #666688;")
-        return lbl
+        layout.addWidget(group)
 
-    def update_stats(self, status: str, fps: float, detections: int, recording: bool) -> None:
-        self._status_badge.set_status(status)
-        self._fps_value.setText(f"{fps:.1f}")
-        self._det_value.setText(str(detections))
-        self._rec_value.setText("On" if recording else "Off")
-        self._rec_value.setStyleSheet(
-            f"font-size: 18px; font-weight: bold; color: {'#e74c3c' if recording else '#888899'};"
+    def update_stats(self, fps: float, detections: int, recording: bool) -> None:
+        self._fps_val.setText(f"{fps:.1f}")
+        self._det_val.setText(str(detections))
+        self._rec_val.setText("On" if recording else "Off")
+        self._rec_val.setStyleSheet(
+            f"font-size:18px;font-weight:bold;color:{'#e74c3c' if recording else '#888899'}"
         )
 
 
@@ -554,7 +529,6 @@ class SettingsDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setSpacing(12)
 
-        # Tab widget
         tabs = QTabWidget()
         tabs.addTab(self._build_camera_tab(), "Camera")
         tabs.addTab(self._build_detector_tab(), "Detector")
@@ -563,20 +537,16 @@ class SettingsDialog(QDialog):
         tabs.addTab(self._build_gateway_tab(), "Gateway")
         layout.addWidget(tabs)
 
-        # Buttons
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
-
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
-
         save_btn = QPushButton("Save")
         save_btn.setStyleSheet(
-            "QPushButton { background-color: #1a3a2a; border-color: #2ecc71; color: #2ecc71; }"
-            "QPushButton:hover { background-color: #2ecc71; color: #ffffff; }"
+            "QPushButton{background:#1a3a2a;border-color:#2ecc71;color:#2ecc71}"
+            "QPushButton:hover{background:#2ecc71;color:#fff}"
         )
         save_btn.clicked.connect(self._on_save)
-
         btn_layout.addWidget(cancel_btn)
         btn_layout.addWidget(save_btn)
         layout.addLayout(btn_layout)
@@ -619,7 +589,20 @@ class SettingsDialog(QDialog):
         self._cam_interval.setValue(self._config.camera.capture_interval)
         layout.addWidget(self._cam_interval, 4, 1)
 
-        layout.setRowStretch(5, 1)
+        layout.addWidget(QLabel("Retry Interval (s):"), 5, 0)
+        self._cam_retry_interval = QDoubleSpinBox()
+        self._cam_retry_interval.setRange(0.5, 60.0)
+        self._cam_retry_interval.setSingleStep(0.5)
+        self._cam_retry_interval.setValue(self._config.camera.retry_interval)
+        layout.addWidget(self._cam_retry_interval, 5, 1)
+
+        layout.addWidget(QLabel("Max Retries:"), 6, 0)
+        self._cam_max_retries = QSpinBox()
+        self._cam_max_retries.setRange(0, 100)
+        self._cam_max_retries.setValue(self._config.camera.max_retries)
+        layout.addWidget(self._cam_max_retries, 6, 1)
+
+        layout.setRowStretch(7, 1)
         return w
 
     def _build_detector_tab(self) -> QWidget:
@@ -629,12 +612,12 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(QLabel("Detector Type:"), 0, 0)
         self._det_type = QComboBox()
-        self._det_type.addItems(["yolo_seg", "mock"])
+        self._det_type.addItems(["seg", "mock"])
         self._det_type.setCurrentText(self._config.detector.type)
         layout.addWidget(self._det_type, 0, 1)
 
         layout.addWidget(QLabel("Model Path:"), 1, 0)
-        self._det_model = QLineEdit(self._config.detector.yolo_seg.model_path)
+        self._det_model = QLineEdit(self._config.detector.seg.model_path)
         layout.addWidget(self._det_model, 1, 1)
 
         layout.addWidget(QLabel("Confidence Threshold:"), 2, 0)
@@ -653,20 +636,20 @@ class SettingsDialog(QDialog):
         self._det_iou = QDoubleSpinBox()
         self._det_iou.setRange(0.01, 1.0)
         self._det_iou.setSingleStep(0.05)
-        self._det_iou.setValue(self._config.detector.yolo_seg.iou_thres)
+        self._det_iou.setValue(self._config.detector.seg.iou_thres)
         layout.addWidget(self._det_iou, 4, 1)
 
         layout.addWidget(QLabel("Image Size:"), 5, 0)
         self._det_img_size = QSpinBox()
         self._det_img_size.setRange(320, 1280)
         self._det_img_size.setSingleStep(32)
-        self._det_img_size.setValue(self._config.detector.yolo_seg.img_size)
+        self._det_img_size.setValue(self._config.detector.seg.img_size)
         layout.addWidget(self._det_img_size, 5, 1)
 
         layout.addWidget(QLabel("Provider:"), 6, 0)
         self._det_provider = QComboBox()
         self._det_provider.addItems(["cpu", "cuda"])
-        self._det_provider.setCurrentText(self._config.detector.yolo_seg.provider)
+        self._det_provider.setCurrentText(self._config.detector.seg.provider)
         layout.addWidget(self._det_provider, 6, 1)
 
         layout.setRowStretch(7, 1)
@@ -732,55 +715,50 @@ class SettingsDialog(QDialog):
         layout = QGridLayout(w)
         layout.setSpacing(10)
 
-        layout.addWidget(QLabel("Process Interval (s):"), 0, 0)
-        self._gw_interval = QDoubleSpinBox()
-        self._gw_interval.setRange(0.1, 300.0)
-        self._gw_interval.setSingleStep(0.5)
-        self._gw_interval.setValue(self._config.gateway.process_interval)
-        layout.addWidget(self._gw_interval, 0, 1)
+        layout.addWidget(QLabel("Notification Interval (s):"), 0, 0)
+        self._gw_notif_interval = QSpinBox()
+        self._gw_notif_interval.setRange(1, 3600)
+        self._gw_notif_interval.setValue(self._config.gateway.notification_interval)
+        self._gw_notif_interval.setToolTip("Minimum seconds between same-label notifications to Feishu")
+        layout.addWidget(self._gw_notif_interval, 0, 1)
 
-        layout.addWidget(QLabel("Notification Cooldown (s):"), 1, 0)
-        self._gw_cooldown = QSpinBox()
-        self._gw_cooldown.setRange(1, 3600)
-        self._gw_cooldown.setValue(self._config.gateway.notification_cooldown)
-        layout.addWidget(self._gw_cooldown, 1, 1)
-
-        layout.addWidget(QLabel("Snapshot Directory:"), 2, 0)
+        layout.addWidget(QLabel("Snapshot Directory:"), 1, 0)
         self._gw_snapshot_dir = QLineEdit(self._config.gateway.snapshot_dir)
-        layout.addWidget(self._gw_snapshot_dir, 2, 1)
+        layout.addWidget(self._gw_snapshot_dir, 1, 1)
 
-        layout.addWidget(QLabel("Frame Queue HWM:"), 3, 0)
+        layout.addWidget(QLabel("Frame Queue HWM:"), 2, 0)
         self._gw_hwm = QSpinBox()
         self._gw_hwm.setRange(1, 1000)
         self._gw_hwm.setValue(self._config.gateway.frame_queue_hwm)
-        layout.addWidget(self._gw_hwm, 3, 1)
+        layout.addWidget(self._gw_hwm, 2, 1)
 
-        layout.addWidget(QLabel("Queue Policy:"), 4, 0)
+        layout.addWidget(QLabel("Queue Policy:"), 3, 0)
         self._gw_policy = QComboBox()
         self._gw_policy.addItems(["drop_oldest", "drop_newest", "block"])
         self._gw_policy.setCurrentText(self._config.gateway.frame_queue_policy)
-        layout.addWidget(self._gw_policy, 4, 1)
+        layout.addWidget(self._gw_policy, 3, 1)
 
-        layout.setRowStretch(5, 1)
+        layout.setRowStretch(4, 1)
         return w
 
     def _on_save(self) -> None:
-        """Apply dialog values to config and save."""
         self._config.camera.device_index = self._cam_device.value()
         self._config.camera.width = self._cam_width.value()
         self._config.camera.height = self._cam_height.value()
         self._config.camera.fps = self._cam_fps.value()
         self._config.camera.capture_interval = self._cam_interval.value()
+        self._config.camera.retry_interval = self._cam_retry_interval.value()
+        self._config.camera.max_retries = self._cam_max_retries.value()
 
         self._config.detector.type = self._det_type.currentText()
-        self._config.detector.yolo_seg.model_path = self._det_model.text()
+        self._config.detector.seg.model_path = self._det_model.text()
         self._config.detector.confidence_threshold = self._det_threshold.value()
         self._config.detector.target_classes = [
             s.strip() for s in self._det_targets.text().split(",") if s.strip()
         ]
-        self._config.detector.yolo_seg.iou_thres = self._det_iou.value()
-        self._config.detector.yolo_seg.img_size = self._det_img_size.value()
-        self._config.detector.yolo_seg.provider = self._det_provider.currentText()
+        self._config.detector.seg.iou_thres = self._det_iou.value()
+        self._config.detector.seg.img_size = self._det_img_size.value()
+        self._config.detector.seg.provider = self._det_provider.currentText()
 
         self._config.notifier.app_id = self._notif_app_id.text()
         self._config.notifier.app_secret = self._notif_app_secret.text()
@@ -792,8 +770,7 @@ class SettingsDialog(QDialog):
         self._config.recorder.fps = self._rec_fps.value()
         self._config.recorder.codec = self._rec_codec.currentText()
 
-        self._config.gateway.process_interval = self._gw_interval.value()
-        self._config.gateway.notification_cooldown = self._gw_cooldown.value()
+        self._config.gateway.notification_interval = self._gw_notif_interval.value()
         self._config.gateway.snapshot_dir = self._gw_snapshot_dir.text()
         self._config.gateway.frame_queue_hwm = self._gw_hwm.value()
         self._config.gateway.frame_queue_policy = self._gw_policy.currentText()
@@ -814,7 +791,7 @@ class SettingsDialog(QDialog):
 # ─── Main Window ──────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
-    """Main application window for LarkSnap with animated dark UI."""
+    """Immersive video-centric main window. Controls via menu only."""
 
     def __init__(
         self,
@@ -829,157 +806,233 @@ class MainWindow(QMainWindow):
         self._config_path = config_path
         self._logger = logging.getLogger("larksnap.ui.main_window")
 
+        self._control_dialog: ControlDialog | None = None
+        self._stats_dialog: StatsDialog | None = None
+
         self.setStyleSheet(DARK_STYLE)
         self.setWindowTitle("LarkSnap")
-        self.setMinimumSize(1020, 660)
+        self.setMinimumSize(800, 500)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowMinMaxButtonsHint)
 
-        # Menu bar
+        # Full video preview as central widget
+        self._preview = VideoPreviewWidget()
+        self.setCentralWidget(self._preview)
+
+        # No status bar — HUD is overlaid on video
+
+        # Build menu bar
         self._build_menu()
 
-        # Central widget
-        central = QWidget()
-        self.setCentralWidget(central)
-        main_layout = QHBoxLayout(central)
-        main_layout.setSpacing(12)
-        main_layout.setContentsMargins(12, 12, 12, 12)
+        # System tray
+        self._tray_icon = QSystemTrayIcon(self)
+        self._tray_icon.setIcon(self._create_tray_icon())
+        self._tray_icon.setToolTip("LarkSnap")
+        self._tray_icon.activated.connect(self._on_tray_activated)
 
-        # Left: Video preview
-        self._preview = VideoPreviewWidget()
-        main_layout.addWidget(self._preview, stretch=3)
+        tray_menu = QMenu()
+        tray_menu.addAction("Show", self._show_window)
+        tray_menu.addSeparator()
+        tray_menu.addAction("Start", self._on_start)
+        tray_menu.addAction("Stop", self._on_stop)
+        tray_menu.addAction("Pause / Resume", self._on_pause_resume)
+        tray_menu.addSeparator()
+        tray_menu.addAction("Record", self._on_record_toggle)
+        tray_menu.addSeparator()
+        tray_menu.addAction("Settings", self._show_settings)
+        tray_menu.addSeparator()
+        tray_menu.addAction("Quit", self._quit_app)
+        self._tray_icon.setContextMenu(tray_menu)
+        self._tray_icon.show()
 
-        # Right: Panels
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(8)
+        self._close_to_tray = True
 
-        self._control_panel = ControlPanel()
-        self._stats_panel = StatsPanel()
-
-        right_layout.addWidget(self._control_panel)
-        right_layout.addWidget(self._stats_panel)
-        right_layout.addStretch()
-
-        main_layout.addWidget(right_panel, stretch=1)
-
-        # Status bar
-        self._status_bar = QStatusBar()
-        self.setStatusBar(self._status_bar)
-        self._status_bar.showMessage("Ready — Press Start to begin detection")
-
-        # Connect signals
-        self._control_panel.start_requested.connect(self._on_start)
-        self._control_panel.stop_requested.connect(self._on_stop)
-        self._control_panel.pause_requested.connect(self._on_pause)
-        self._control_panel.resume_requested.connect(self._on_resume)
-        self._control_panel.start_recording_requested.connect(self._on_start_recording)
-        self._control_panel.stop_recording_requested.connect(self._on_stop_recording)
+        # Subscribe to gateway events
+        self._controller.event_bus.subscribe(EventType.CAMERA_FAILED, self._on_camera_failed)
 
         # Timers
         self._preview_timer = QTimer(self)
         self._preview_timer.timeout.connect(self._update_preview)
         self._preview_timer.setInterval(33)
 
-        self._status_timer = QTimer(self)
-        self._status_timer.timeout.connect(self._update_status)
-        self._status_timer.setInterval(500)
-
-        # Pulse animation for recording indicator
-        self._pulse_anim = QPropertyAnimation(self._control_panel._pulse, b"opacity")
-        self._pulse_anim.setDuration(800)
-        self._pulse_anim.setStartValue(1.0)
-        self._pulse_anim.setEndValue(0.2)
-        self._pulse_anim.setEasingCurve(QEasingCurve.InOutSine)
-        self._pulse_anim.setLoopCount(-1)
+        self._hud_timer = QTimer(self)
+        self._hud_timer.timeout.connect(self._update_hud)
+        self._hud_timer.setInterval(200)
 
     def _build_menu(self) -> None:
         menu_bar = self.menuBar()
 
-        # File menu
-        file_menu = menu_bar.addMenu("File")
+        # ── Detection menu ──
+        det_menu = menu_bar.addMenu("Detection")
 
-        settings_action = file_menu.addAction("Settings")
-        settings_action.setShortcut("Ctrl+,")
-        settings_action.triggered.connect(self._show_settings)
+        self._start_action = det_menu.addAction("Start")
+        self._start_action.setShortcut("Ctrl+S")
+        self._start_action.triggered.connect(self._on_start)
 
-        file_menu.addSeparator()
+        self._stop_action = det_menu.addAction("Stop")
+        self._stop_action.setShortcut("Ctrl+D")
+        self._stop_action.triggered.connect(self._on_stop)
+        self._stop_action.setEnabled(False)
 
-        quit_action = file_menu.addAction("Quit")
-        quit_action.setShortcut("Ctrl+Q")
-        quit_action.triggered.connect(self.close)
+        det_menu.addSeparator()
 
-        # View menu
+        self._pause_action = det_menu.addAction("Pause")
+        self._pause_action.setShortcut("Space")
+        self._pause_action.triggered.connect(self._on_pause_resume)
+        self._pause_action.setEnabled(False)
+
+        # ── Recording menu ──
+        rec_menu = menu_bar.addMenu("Recording")
+
+        self._record_action = rec_menu.addAction("Start Recording")
+        self._record_action.setShortcut("Ctrl+R")
+        self._record_action.triggered.connect(self._on_record_toggle)
+        self._record_action.setEnabled(False)
+
+        # ── View menu ──
         view_menu = menu_bar.addMenu("View")
 
-        fullscreen_action = view_menu.addAction("Fullscreen")
-        fullscreen_action.setShortcut("F11")
-        fullscreen_action.triggered.connect(self._toggle_fullscreen)
+        view_menu.addAction("Controls", self._show_control_dialog, "Ctrl+L")
+        view_menu.addAction("Statistics", self._show_stats_dialog, "Ctrl+I")
+        view_menu.addSeparator()
+        view_menu.addAction("Fullscreen", self._toggle_fullscreen, "F11")
+        view_menu.addSeparator()
+        self._hud_action = view_menu.addAction("Show HUD")
+        self._hud_action.setCheckable(True)
+        self._hud_action.setChecked(True)
+        self._hud_action.setShortcut("Ctrl+H")
+        self._hud_action.toggled.connect(self._toggle_hud)
 
-        # Help menu
+        # ── Settings menu ──
+        settings_menu = menu_bar.addMenu("Settings")
+        settings_menu.addAction("Preferences", self._show_settings, "Ctrl+,")
+
+        # ── Help menu ──
         help_menu = menu_bar.addMenu("Help")
-        about_action = help_menu.addAction("About")
-        about_action.triggered.connect(self._show_about)
+        help_menu.addAction("About", self._show_about)
 
-    def _show_settings(self) -> None:
-        dialog = SettingsDialog(self._config, self._config_path, self)
-        dialog.config_saved.connect(self._on_config_saved)
-        dialog.exec()
+    # ── Menu action handlers ──
 
-    def _on_config_saved(self) -> None:
-        self._status_bar.showMessage("Settings saved — restart to apply changes", 4000)
+    def _on_camera_failed(self, event: Event) -> None:
+        """Handle camera failure event — show error dialog."""
+        data = event.data or {}
+        device_index = data.get("device_index", "?")
+        error_msg = data.get("error", "Unknown error")
+        QMessageBox.critical(
+            self,
+            "Camera Error",
+            f"Failed to open camera (device {device_index}).\n\n"
+            f"Error: {error_msg}\n\n"
+            f"Please check that the camera is connected and not in use by another application.",
+        )
+
+    def _on_start(self) -> None:
+        if not self._controller.is_running:
+            try:
+                self._controller.initialize()
+                self._controller.start()
+            except Exception as e:
+                from larksnap.utils.exceptions import CameraError
+                if isinstance(e, (CameraError,)) or "camera" in str(e).lower():
+                    # Camera error already handled by event bus
+                    self._update_action_states()
+                    return
+                raise
+        self._update_action_states()
+        self._preview.show_hud_temporarily()
+
+    def _on_stop(self) -> None:
+        self._controller.stop()
+        self._update_action_states()
+        if self._control_dialog:
+            self._control_dialog.set_running(False)
+            self._control_dialog.set_recording(False)
+        if self._stats_dialog:
+            self._stats_dialog.update_stats(0, 0, False)
+
+    def _on_pause_resume(self) -> None:
+        if not self._controller.is_running:
+            return
+        if self._controller.is_paused:
+            self._controller.resume()
+        else:
+            self._controller.pause()
+        self._update_action_states()
+        if self._control_dialog:
+            self._control_dialog.set_paused(self._controller.is_paused)
+
+    def _on_record_toggle(self) -> None:
+        if self._controller.is_recording:
+            self._controller.stop_recording()
+        else:
+            self._controller.start_recording()
+        self._update_action_states()
+        if self._control_dialog:
+            self._control_dialog.set_recording(self._controller.is_recording)
+
+    def _update_action_states(self) -> None:
+        running = self._controller.is_running
+        paused = self._controller.is_paused
+        recording = self._controller.is_recording
+
+        self._start_action.setEnabled(not running)
+        self._stop_action.setEnabled(running)
+        self._pause_action.setEnabled(running)
+        self._pause_action.setText("Resume" if paused else "Pause")
+        self._record_action.setEnabled(running)
+        self._record_action.setText("Stop Recording" if recording else "Start Recording")
 
     def _toggle_fullscreen(self) -> None:
         if self.isFullScreen():
             self.showNormal()
+            self.menuBar().show()
         else:
+            self.menuBar().hide()
             self.showFullScreen()
 
+    def _toggle_hud(self, checked: bool) -> None:
+        self._preview._show_hud = checked
+        if not checked:
+            self._preview._hud_timer.stop()
+        self._preview.update()
+
+    def _show_control_dialog(self) -> None:
+        if self._control_dialog is None:
+            self._control_dialog = ControlDialog(self)
+            self._control_dialog.start_requested.connect(self._on_start)
+            self._control_dialog.stop_requested.connect(self._on_stop)
+            self._control_dialog.pause_requested.connect(self._on_pause_resume)
+            self._control_dialog.resume_requested.connect(self._on_pause_resume)
+            self._control_dialog.start_recording_requested.connect(self._on_record_toggle)
+            self._control_dialog.stop_recording_requested.connect(self._on_record_toggle)
+        self._control_dialog.set_running(self._controller.is_running)
+        self._control_dialog.set_paused(self._controller.is_paused)
+        self._control_dialog.set_recording(self._controller.is_recording)
+        self._control_dialog.show()
+        self._control_dialog.raise_()
+
+    def _show_stats_dialog(self) -> None:
+        if self._stats_dialog is None:
+            self._stats_dialog = StatsDialog(self)
+        self._stats_dialog.show()
+        self._stats_dialog.raise_()
+
+    def _show_settings(self) -> None:
+        dialog = SettingsDialog(self._config, self._config_path, self)
+        dialog.config_saved.connect(lambda: None)
+        dialog.exec()
+
     def _show_about(self) -> None:
-        QMessageBox.about(self, "About LarkSnap", "LarkSnap v0.1.0\n\nGateway-controlled object detection system with ZeroMQ message queue.")
+        QMessageBox.about(self, "About LarkSnap", "LarkSnap v0.1.0\n\nGateway-controlled object detection with ZeroMQ.")
+
+    # ── Timers ──
 
     def start_preview(self) -> None:
         self._preview_timer.start()
-        self._status_timer.start()
+        self._hud_timer.start()
 
     def stop_preview(self) -> None:
         self._preview_timer.stop()
-        self._status_timer.stop()
-        self._pulse_anim.stop()
-
-    def _on_start(self) -> None:
-        if not self._controller.is_running:
-            self._controller.initialize()
-            self._controller.start()
-        self._control_panel.set_running(True)
-        self._status_bar.showMessage("Detection running")
-
-    def _on_stop(self) -> None:
-        self._controller.stop()
-        self._control_panel.set_running(False)
-        self._control_panel.set_recording(False)
-        self._status_bar.showMessage("Detection stopped")
-
-    def _on_pause(self) -> None:
-        self._controller.pause()
-        self._control_panel.set_paused(True)
-        self._status_bar.showMessage("Detection paused")
-
-    def _on_resume(self) -> None:
-        self._controller.resume()
-        self._control_panel.set_paused(False)
-        self._status_bar.showMessage("Detection running")
-
-    def _on_start_recording(self) -> None:
-        self._controller.start_recording()
-        self._control_panel.set_recording(True)
-        self._pulse_anim.start()
-        self._status_bar.showMessage("Recording started")
-
-    def _on_stop_recording(self) -> None:
-        self._controller.stop_recording()
-        self._control_panel.set_recording(False)
-        self._pulse_anim.stop()
-        self._status_bar.showMessage("Recording stopped")
+        self._hud_timer.stop()
 
     def _update_preview(self) -> None:
         frame = self._controller.get_latest_frame()
@@ -987,34 +1040,83 @@ class MainWindow(QMainWindow):
             results = self._controller.get_latest_results()
             self._preview.update_frame(frame, results)
 
-    def _update_status(self) -> None:
-        is_running = self._controller.is_running
-        is_paused = self._controller.is_paused
-        is_recording = self._controller.is_recording
-
-        if is_running:
-            status = "paused" if is_paused else "running"
-        else:
-            status = "stopped"
-        if is_recording:
-            status = "recording"
-
-        self._stats_panel.update_stats(
-            status=status,
+    def _update_hud(self) -> None:
+        self._preview.update_hud(
             fps=self._controller.producer_fps,
-            detections=self._controller.detection_count,
-            recording=is_recording,
+            detection_count=self._controller.detection_count,
+            running=self._controller.is_running,
+            paused=self._controller.is_paused,
+            recording=self._controller.is_recording,
         )
+        if self._stats_dialog and self._stats_dialog.isVisible():
+            self._stats_dialog.update_stats(
+                fps=self._controller.producer_fps,
+                detections=self._controller.detection_count,
+                recording=self._controller.is_recording,
+            )
+
+    # ── Keyboard ──
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
-        if event.key() == Qt.Key_Space and self._controller.is_running:
-            if self._controller.is_paused:
-                self._on_resume()
-            else:
-                self._on_pause()
-        super().keyPressEvent(event)
+        key = event.key()
+        if key == Qt.Key_Space:
+            self._on_pause_resume()
+        elif key == Qt.Key_Escape and self.isFullScreen():
+            self.showNormal()
+            self.menuBar().show()
+        else:
+            super().keyPressEvent(event)
+
+    # ── Tray & close ──
+
+    def changeEvent(self, event) -> None:
+        if event.type() == event.Type.WindowStateChange:
+            if self.windowState() & Qt.WindowMinimized:
+                if self._close_to_tray:
+                    QTimer.singleShot(0, self.hide)
+                    self._tray_icon.showMessage(
+                        "LarkSnap", "Running in background. Click tray icon to restore.",
+                        QSystemTrayIcon.Information, 2000,
+                    )
+        super().changeEvent(event)
 
     def closeEvent(self, event) -> None:
-        self._controller.stop()
-        self.stop_preview()
-        super().closeEvent(event)
+        if self._close_to_tray:
+            event.ignore()
+            self.hide()
+            self._tray_icon.showMessage(
+                "LarkSnap", "Minimized to tray. Right-click to quit.",
+                QSystemTrayIcon.Information, 2000,
+            )
+        else:
+            self._controller.stop()
+            self.stop_preview()
+            self._tray_icon.hide()
+            super().closeEvent(event)
+
+    def _create_tray_icon(self) -> QIcon:
+        pixmap = QPixmap(64, 64)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setBrush(QColor(106, 106, 174))
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(4, 4, 56, 56)
+        painter.setPen(QColor(255, 255, 255))
+        painter.setFont(QFont("Segoe UI", 20, QFont.Bold))
+        painter.drawText(QRect(0, 0, 64, 64), Qt.AlignCenter, "LS")
+        painter.end()
+        return QIcon(pixmap)
+
+    def _on_tray_activated(self, reason) -> None:
+        if reason == QSystemTrayIcon.DoubleClick:
+            self._show_window()
+
+    def _show_window(self) -> None:
+        self.showNormal()
+        self.activateWindow()
+        self.raise_()
+
+    def _quit_app(self) -> None:
+        self._close_to_tray = False
+        self.close()
