@@ -49,7 +49,7 @@ class FeishuWSClient:
     """
 
     # Supported commands
-    COMMANDS = ("start", "stop", "pause", "resume", "status", "help")
+    COMMANDS = ("init", "start", "stop", "pause", "resume", "status", "help")
 
     def __init__(
         self,
@@ -112,11 +112,12 @@ class FeishuWSClient:
                 self._config.app_id,
                 self._config.app_secret,
                 event_handler=event_handler,
-                log_level=lark.LogLevel.WARNING,
+                log_level=lark.LogLevel.INFO,
             )
 
             self._logger.info("Feishu WS client connecting...")
             self._client.start()
+            self._logger.info("Feishu WS client disconnected")
         except Exception as e:
             if self._running:
                 self._logger.error("Feishu WS client error: %s", e)

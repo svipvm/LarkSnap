@@ -5,10 +5,12 @@ import cv2
 import numpy as np
 
 from larksnap.adapters.camera.interface import CameraAdapter
+from larksnap.adapters.registry import camera_registry
 from larksnap.config.models import CameraConfig
 from larksnap.utils.exceptions import CameraError
 
 
+@camera_registry.register("opencv")
 class OpenCVCameraAdapter(CameraAdapter):
     """OpenCV-based camera adapter for local webcam capture."""
 

@@ -16,6 +16,9 @@ class EventType(str, Enum):
     CAMERA_FAILED = "camera_failed"
     SYSTEM_STARTED = "system_started"
     SYSTEM_STOPPED = "system_stopped"
+    CHAT_ID_OBTAINED = "chat_id_obtained"
+    NOTIFICATION_ENABLED = "notification_enabled"
+    NOTIFICATION_DISABLED = "notification_disabled"
 
 
 @dataclass

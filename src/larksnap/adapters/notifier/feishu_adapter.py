@@ -8,12 +8,14 @@ from pathlib import Path
 import httpx
 
 from larksnap.adapters.notifier.interface import NotificationMessage, NotifierAdapter
+from larksnap.adapters.registry import notifier_registry
 from larksnap.config.models import NotifierConfig
 from larksnap.utils.exceptions import NotifierError
 
 _FEISHU_BASE_URL = "https://open.feishu.cn/open-apis"
 
 
+@notifier_registry.register("feishu")
 class FeishuNotifierAdapter(NotifierAdapter):
     """Feishu (Lark) notifier adapter using app API."""
 
@@ -29,14 +31,75 @@ class FeishuNotifierAdapter(NotifierAdapter):
         try:
             self._client = httpx.Client(timeout=30.0)
             self._logger.info("Feishu notifier connected")
+            # Auto-detect chat_id from existing bot chats if not configured
+            if not self._config.chat_id:
+                self._auto_detect_chat_id()
         except Exception as e:
             raise NotifierError(f"Failed to connect to Feishu: {e}") from e
 
+    def _auto_detect_chat_id(self) -> None:
+        """Try to auto-detect chat_id from bot's existing chats via API."""
+        try:
+            token = self._get_tenant_token()
+            if not token:
+                return
+            resp = self._client.get(
+                f"{_FEISHU_BASE_URL}/im/v1/chats",
+                headers={"Authorization": f"Bearer {token}"},
+                params={"page_size": 20},
+            )
+            data = resp.json()
+            if data.get("code") != 0:
+                self._logger.debug("Failed to list chats: %s", data.get("msg"))
+                return
+            items = data.get("data", {}).get("items", [])
+            if items:
+                # Use the first available P2P chat
+                chat_id = items[0].get("chat_id", "")
+                if chat_id:
+                    self._config.chat_id = chat_id
+                    self._persist_chat_id(chat_id)
+                    self._logger.info(
+                        "Auto-detected chat_id from bot chats: %s", chat_id
+                    )
+        except Exception as e:
+            self._logger.debug("Auto-detect chat_id failed: %s", e)
+
     def set_chat_id(self, chat_id: str) -> None:
-        """Update the target chat ID for notifications."""
+        """Update the target chat ID for notifications and persist to config."""
         if chat_id and chat_id != self._config.chat_id:
             self._config.chat_id = chat_id
             self._logger.info("Notification target chat updated: %s", chat_id)
+            self._persist_chat_id(chat_id)
+
+    def _persist_chat_id(self, chat_id: str) -> None:
+        """Save chat_id to config file so it persists across restarts."""
+        try:
+            from larksnap.config.loader import save_config
+            from larksnap.config.models import AppConfig
+
+            config_path = str(
+                Path(__file__).parent.parent.parent.parent.parent
+                / "config" / "config.yaml"
+            )
+            path = Path(config_path)
+            if not path.exists():
+                return
+
+            with open(path, encoding="utf-8") as f:
+                import yaml
+                raw = yaml.safe_load(f) or {}
+
+            if "notifier" not in raw:
+                raw["notifier"] = {}
+            raw["notifier"]["chat_id"] = chat_id
+
+            with open(path, "w", encoding="utf-8") as f:
+                yaml.dump(raw, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+
+            self._logger.info("Chat ID persisted to config file")
+        except Exception as e:
+            self._logger.warning("Failed to persist chat_id to config: %s", e)
 
     def send_message(self, message: NotificationMessage) -> bool:
         """Send a notification message via Feishu app API.
@@ -160,7 +223,10 @@ class FeishuNotifierAdapter(NotifierAdapter):
                 resp = self._client.post(  # type: ignore[union-attr]
                     f"{_FEISHU_BASE_URL}/im/v1/messages",
                     headers={"Authorization": f"Bearer {token}"},
-                    params={"receive_id": self._config.chat_id},
+                    params={
+                        "receive_id_type": "chat_id",
+                        "receive_id": self._config.chat_id,
+                    },
                     json={
                         "receive_id": self._config.chat_id,
                         "msg_type": "image",
@@ -206,7 +272,10 @@ class FeishuNotifierAdapter(NotifierAdapter):
                 resp = self._client.post(  # type: ignore[union-attr]
                     f"{_FEISHU_BASE_URL}/im/v1/messages",
                     headers={"Authorization": f"Bearer {token}"},
-                    params={"receive_id": self._config.chat_id},
+                    params={
+                        "receive_id_type": "chat_id",
+                        "receive_id": self._config.chat_id,
+                    },
                     json={
                         "receive_id": self._config.chat_id,
                         "msg_type": "text",
@@ -250,7 +319,10 @@ class FeishuNotifierAdapter(NotifierAdapter):
             self._client.post(  # type: ignore[union-attr]
                 f"{_FEISHU_BASE_URL}/im/v1/messages",
                 headers={"Authorization": f"Bearer {token}"},
-                params={"receive_id": self._config.chat_id},
+                params={
+                    "receive_id_type": "chat_id",
+                    "receive_id": self._config.chat_id,
+                },
                 json={
                     "receive_id": self._config.chat_id,
                     "msg_type": "text",
@@ -259,3 +331,32 @@ class FeishuNotifierAdapter(NotifierAdapter):
             )
         except httpx.RequestError:
             self._logger.warning("Failed to send companion text message")
+
+    def send_text(self, text: str) -> bool:
+        """Send a plain text message to the configured chat (for command responses)."""
+        if not self._client or not self._config.chat_id:
+            return False
+        try:
+            token = self._get_tenant_token()
+            resp = self._client.post(
+                f"{_FEISHU_BASE_URL}/im/v1/messages",
+                headers={"Authorization": f"Bearer {token}"},
+                params={
+                    "receive_id_type": "chat_id",
+                    "receive_id": self._config.chat_id,
+                },
+                json={
+                    "receive_id": self._config.chat_id,
+                    "msg_type": "text",
+                    "content": f'{{"text": "{text}"}}',
+                },
+            )
+            data = resp.json()
+            if data.get("code") == 0:
+                self._logger.info("Feishu text sent: %s", text[:50])
+                return True
+            self._logger.warning("Feishu text send error: %s", data.get("msg"))
+            return False
+        except Exception as e:
+            self._logger.warning("Failed to send text: %s", e)
+            return False

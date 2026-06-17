@@ -5,10 +5,12 @@ import time
 import numpy as np
 
 from larksnap.adapters.detector.interface import BBox, DetectionResult, DetectorAdapter
+from larksnap.adapters.registry import detector_registry
 from larksnap.config.models import DetectorConfig
 from larksnap.utils.exceptions import DetectorError
 
 
+@detector_registry.register("mock")
 class MockDetectorAdapter(DetectorAdapter):
     """Mock detector adapter that returns simulated detection results."""
 

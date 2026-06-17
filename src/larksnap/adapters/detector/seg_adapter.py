@@ -11,10 +11,12 @@ import logging
 import numpy as np
 
 from larksnap.adapters.detector.interface import BBox, DetectionResult, DetectorAdapter
+from larksnap.adapters.registry import detector_registry
 from larksnap.config.models import DetectorConfig
 from larksnap.utils.exceptions import DetectorError
 
 
+@detector_registry.register("seg")
 class SegDetectorAdapter(DetectorAdapter):
     """Detector adapter using Instance Segmentation ONNX Runtime inference."""
 

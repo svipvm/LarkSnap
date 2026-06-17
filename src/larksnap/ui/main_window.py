@@ -28,6 +28,7 @@ from PySide6.QtGui import (
     QKeyEvent,
     QMouseEvent,
     QPainter,
+    QPen,
     QPixmap,
 )
 from PySide6.QtWidgets import (
@@ -188,6 +189,82 @@ QCheckBox::indicator:checked {
 """
 
 
+# ─── Init Overlay (shown when chat_id not obtained) ───────────────────
+
+class InitOverlayWidget(QWidget):
+    """Semi-transparent overlay with spinning indicator and init prompt."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._angle = 0
+        self._timer = QTimer(self)
+        self._timer.setInterval(30)
+        self._timer.timeout.connect(self._rotate)
+        self.hide()
+
+    def show_overlay(self) -> None:
+        self.show()
+        self.raise_()
+        self._timer.start()
+
+    def hide_overlay(self) -> None:
+        self._timer.stop()
+        self.hide()
+
+    def _rotate(self) -> None:
+        self._angle = (self._angle + 6) % 360
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        # Semi-transparent dark background
+        painter.fillRect(self.rect(), QColor(10, 10, 20, 200))
+
+        cx = self.width() // 2
+        cy = self.height() // 2 - 30
+
+        # Spinning arc
+        painter.save()
+        painter.translate(cx, cy)
+        painter.rotate(self._angle)
+
+        pen = QPen(QColor(106, 106, 174), 4, Qt.SolidLine, Qt.RoundCap)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        rect = QRect(-24, -24, 48, 48)
+        painter.drawArc(rect, 0, 270 * 16)
+
+        # Small dot at the leading edge
+        painter.setBrush(QColor(106, 106, 174))
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(20, -4, 8, 8)
+
+        painter.restore()
+
+        # Prompt text
+        painter.setPen(QColor(200, 200, 220))
+        painter.setFont(QFont("Segoe UI", 14))
+        text = "请在聊天软件中发送 /init 命令进行初始化以获取 chat_id"
+        text_rect = QRect(0, cy + 50, self.width(), 40)
+        painter.drawText(text_rect, Qt.AlignCenter, text)
+
+        # Sub-text
+        painter.setPen(QColor(120, 120, 150))
+        painter.setFont(QFont("Segoe UI", 10))
+        sub_text = "Waiting for initialization..."
+        sub_rect = QRect(0, cy + 90, self.width(), 30)
+        painter.drawText(sub_rect, Qt.AlignCenter, sub_text)
+
+        painter.end()
+
+    def resizeEvent(self, event) -> None:
+        if self.parent():
+            self.setGeometry(0, 0, self.parent().width(), self.parent().height())
+        super().resizeEvent(event)
+
+
 # ─── Video Preview (Full-screen immersive) ────────────────────────────
 
 class VideoPreviewWidget(QWidget):
@@ -206,6 +283,7 @@ class VideoPreviewWidget(QWidget):
         self._is_paused: bool = False
         self._rec_pulse_phase: float = 0.0
         self._show_hud: bool = True
+        self._notification_enabled: bool = True
 
         # HUD auto-hide timer
         self._hud_timer = QTimer(self)
@@ -271,12 +349,13 @@ class VideoPreviewWidget(QWidget):
         self._pixmap = QPixmap.fromImage(qimage)
         self.update()
 
-    def update_hud(self, fps: float, detection_count: int, running: bool, paused: bool, recording: bool) -> None:
+    def update_hud(self, fps: float, detection_count: int, running: bool, paused: bool, recording: bool, notification_enabled: bool = True) -> None:
         self._fps = fps
         self._detection_count = detection_count
         self._is_running = running
         self._is_paused = paused
         self._is_recording = recording
+        self._notification_enabled = notification_enabled
         if recording:
             self._rec_pulse_phase = (self._rec_pulse_phase + 0.1) % (2 * 3.14159)
         self.update()
@@ -315,7 +394,7 @@ class VideoPreviewWidget(QWidget):
         # Top-left: status + FPS
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor(0, 0, 0, 120))
-        painter.drawRoundedRect(12, 12, 200, 50, 8, 8)
+        painter.drawRoundedRect(12, 12, 200, 68, 8, 8)
 
         painter.setFont(QFont("Segoe UI", 11))
         if self._is_running:
@@ -330,6 +409,14 @@ class VideoPreviewWidget(QWidget):
         painter.setPen(QColor("#c0c0d0"))
         painter.setFont(QFont("Segoe UI", 10))
         painter.drawText(22, 52, f"FPS: {self._fps:.1f}")
+
+        # Notification status
+        if self._notification_enabled:
+            painter.setPen(QColor("#2ecc71"))
+            painter.drawText(22, 70, "NOTIFY: ON")
+        else:
+            painter.setPen(QColor("#e74c3c"))
+            painter.drawText(22, 70, "NOTIFY: OFF")
 
         # Top-right: recording indicator
         if self._is_recording:
@@ -818,6 +905,9 @@ class MainWindow(QMainWindow):
         self._preview = VideoPreviewWidget()
         self.setCentralWidget(self._preview)
 
+        # Init overlay (shown when chat_id not obtained)
+        self._init_overlay = InitOverlayWidget(self._preview)
+
         # No status bar — HUD is overlaid on video
 
         # Build menu bar
@@ -848,6 +938,9 @@ class MainWindow(QMainWindow):
 
         # Subscribe to gateway events
         self._controller.event_bus.subscribe(EventType.CAMERA_FAILED, self._on_camera_failed)
+        self._controller.event_bus.subscribe(EventType.CHAT_ID_OBTAINED, self._on_chat_id_obtained)
+        self._controller.event_bus.subscribe(EventType.NOTIFICATION_ENABLED, self._on_notification_enabled)
+        self._controller.event_bus.subscribe(EventType.NOTIFICATION_DISABLED, self._on_notification_disabled)
 
         # Timers
         self._preview_timer = QTimer(self)
@@ -925,11 +1018,27 @@ class MainWindow(QMainWindow):
             f"Please check that the camera is connected and not in use by another application.",
         )
 
+    def _on_chat_id_obtained(self, event: Event) -> None:
+        """Handle chat_id obtained — hide init overlay."""
+        self._logger.info("Chat ID obtained, hiding init overlay")
+        self._init_overlay.hide_overlay()
+
+    def _on_notification_enabled(self, event: Event) -> None:
+        """Handle notification enabled — update HUD."""
+        self._preview.show_hud_temporarily()
+
+    def _on_notification_disabled(self, event: Event) -> None:
+        """Handle notification disabled — update HUD."""
+        self._preview.show_hud_temporarily()
+
     def _on_start(self) -> None:
         if not self._controller.is_running:
             try:
                 self._controller.initialize()
                 self._controller.start()
+                # Show init overlay if chat_id not yet obtained
+                if not self._config.notifier.chat_id:
+                    self._init_overlay.show_overlay()
             except Exception as e:
                 from larksnap.utils.exceptions import CameraError
                 if isinstance(e, (CameraError,)) or "camera" in str(e).lower():
@@ -1039,6 +1148,9 @@ class MainWindow(QMainWindow):
         if frame is not None:
             results = self._controller.get_latest_results()
             self._preview.update_frame(frame, results)
+        # Keep init overlay sized to preview
+        if self._init_overlay.isVisible():
+            self._init_overlay.setGeometry(0, 0, self._preview.width(), self._preview.height())
 
     def _update_hud(self) -> None:
         self._preview.update_hud(
@@ -1047,6 +1159,7 @@ class MainWindow(QMainWindow):
             running=self._controller.is_running,
             paused=self._controller.is_paused,
             recording=self._controller.is_recording,
+            notification_enabled=self._controller.notification_enabled,
         )
         if self._stats_dialog and self._stats_dialog.isVisible():
             self._stats_dialog.update_stats(

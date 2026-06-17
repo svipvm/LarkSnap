@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 class CameraConfig(BaseModel):
     """Camera device configuration."""
 
+    type: str = "opencv"
     device_index: int = 0
     width: int = 1280
     height: int = 720
@@ -72,9 +73,12 @@ class RecorderConfig(BaseModel):
 
 
 class GatewayConfig(BaseModel):
-    """Gateway controller configuration."""
+    """Gateway controller configuration.
 
-    event_queue_size: int = 100
+    Only contains pipeline-level and notification-level settings.
+    Module-specific settings are owned by their respective modules.
+    """
+
     notification_interval: int = 30
     snapshot_dir: str = "snapshots"
     frame_queue_hwm: int = 30
