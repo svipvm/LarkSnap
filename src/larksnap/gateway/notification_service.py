@@ -52,7 +52,7 @@ class NotificationService:
         self._event_bus = event_bus
         self._logger = logging.getLogger("larksnap.notification_service")
         self._last_notification_time: dict[str, float] = {}
-        self._notification_enabled = False  # Disabled until /start command received
+        self._notification_enabled = True  # Enabled by default when pipeline starts
 
     @property
     def notification_enabled(self) -> bool:

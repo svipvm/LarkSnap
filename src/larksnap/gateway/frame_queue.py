@@ -74,7 +74,16 @@ class FrameProducer:
     """Captures frames from camera and pushes them to ZMQ socket.
 
     Runs in a dedicated thread, decoupling camera capture from model inference.
+
+    Implements exponential backoff retry on read failures and stops after
+    max_consecutive_failures to avoid resource waste when camera is unavailable.
     """
+
+    # Retry configuration
+    INITIAL_BACKOFF_MS: int = 1000       # Initial backoff on read failure
+    MAX_BACKOFF_MS: int = 5000          # Maximum backoff cap
+    BACKOFF_MULTIPLIER: float = 1.5    # Exponential growth factor
+    MAX_CONSECUTIVE_FAILURES: int = 5  # Stop producer after this many consecutive failures
 
     def __init__(
         self,
@@ -96,6 +105,9 @@ class FrameProducer:
         self._fps: float = 0.0
         self._last_fps_time: float = 0.0
         self._fps_frame_count: int = 0
+        self._consecutive_failures: int = 0
+        self._current_backoff_ms: int = self.INITIAL_BACKOFF_MS
+        self._on_fatal_error = None
 
     @property
     def is_running(self) -> bool:
@@ -104,6 +116,17 @@ class FrameProducer:
     @property
     def fps(self) -> float:
         return self._fps
+
+    @property
+    def consecutive_failures(self) -> int:
+        return self._consecutive_failures
+
+    def set_on_fatal_error(self, callback) -> None:
+        """Set callback for when producer stops due to fatal camera errors.
+
+        callback(error_message: str)
+        """
+        self._on_fatal_error = callback
 
     def start(self, context: zmq.Context | None = None) -> None:
         """Start the frame producer thread."""
@@ -119,6 +142,8 @@ class FrameProducer:
         self._frame_index = 0
         self._fps_frame_count = 0
         self._last_fps_time = time.time()
+        self._consecutive_failures = 0
+        self._current_backoff_ms = self.INITIAL_BACKOFF_MS
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
         self._logger.info("Frame producer started on %s", self._zmq_url)
@@ -126,12 +151,13 @@ class FrameProducer:
     def stop(self) -> None:
         """Stop the frame producer."""
         self._running = False
-        if self._thread is not None:
-            self._thread.join(timeout=5.0)
-            self._thread = None
+        # Close socket first to unblock any pending ZMQ operations
         if self._socket is not None:
             self._socket.close(linger=0)
             self._socket = None
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+            self._thread = None
         self._logger.info("Frame producer stopped")
 
     def _run_loop(self) -> None:
@@ -169,9 +195,57 @@ class FrameProducer:
                 self._fps_frame_count += 1
                 self._update_fps()
 
+                # Reset failure tracking on successful read
+                if self._consecutive_failures > 0:
+                    self._logger.info(
+                        "Camera read recovered after %d consecutive failures",
+                        self._consecutive_failures,
+                    )
+                self._consecutive_failures = 0
+                self._current_backoff_ms = self.INITIAL_BACKOFF_MS
+
             except Exception as e:
-                self._logger.error("Frame producer error: %s", e)
-                time.sleep(0.1)
+                self._consecutive_failures += 1
+
+                if self._consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES:
+                    self._logger.error(
+                        "Camera read failed %d consecutive times, stopping producer: %s",
+                        self._consecutive_failures, e,
+                    )
+                    self._running = False
+                    # Schedule fatal error callback on a separate thread to
+                    # avoid deadlock (calling Pipeline.stop() from within the
+                    # producer thread would try to join itself).
+                    if self._on_fatal_error is not None:
+                        threading.Thread(
+                            target=self._on_fatal_error,
+                            args=(str(e),),
+                            daemon=True,
+                        ).start()
+                    break
+
+                # Log with appropriate frequency (every 1st, 5th, 10th, 20th, etc.)
+                log_interval = 1
+                if self._consecutive_failures > 10:
+                    log_interval = 10
+                elif self._consecutive_failures > 5:
+                    log_interval = 5
+
+                if self._consecutive_failures % log_interval == 0:
+                    self._logger.warning(
+                        "Camera read failure %d/%d: %s (backoff: %.1fs)",
+                        self._consecutive_failures,
+                        self.MAX_CONSECUTIVE_FAILURES,
+                        e,
+                        self._current_backoff_ms / 1000.0,
+                    )
+
+                # Exponential backoff
+                time.sleep(self._current_backoff_ms / 1000.0)
+                self._current_backoff_ms = min(
+                    int(self._current_backoff_ms * self.BACKOFF_MULTIPLIER),
+                    self.MAX_BACKOFF_MS,
+                )
 
     def _update_fps(self) -> None:
         now = time.time()
@@ -234,12 +308,13 @@ class FrameConsumer:
     def stop(self) -> None:
         """Stop the frame consumer."""
         self._running = False
-        if self._thread is not None:
-            self._thread.join(timeout=5.0)
-            self._thread = None
+        # Close socket first to unblock any pending ZMQ operations
         if self._socket is not None:
             self._socket.close(linger=0)
             self._socket = None
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+            self._thread = None
         self._logger.info("Frame consumer stopped")
 
     def _run_loop(self) -> None:
@@ -350,12 +425,13 @@ class ResultSubscriber:
 
     def stop(self) -> None:
         self._running = False
-        if self._thread is not None:
-            self._thread.join(timeout=5.0)
-            self._thread = None
+        # Close socket first to unblock any pending ZMQ operations
         if self._socket is not None:
             self._socket.close(linger=0)
             self._socket = None
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+            self._thread = None
         self._logger.info("Result subscriber stopped")
 
     def _run_loop(self) -> None:

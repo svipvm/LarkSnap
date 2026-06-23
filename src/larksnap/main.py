@@ -42,6 +42,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def run_with_qt(config_path: str | None) -> None:
     """Run the application with PySide6 GUI."""
+    import atexit
+
     from PySide6.QtWidgets import QApplication
 
     from larksnap.ui.main_window import MainWindow
@@ -63,12 +65,15 @@ def run_with_qt(config_path: str | None) -> None:
     app.setQuitOnLastWindowClosed(True)
 
     controller = GatewayController(config)
+
+    # Ensure controller.stop() runs even if app.exec() is interrupted
+    atexit.register(controller.stop)
+
     window = MainWindow(controller, config, config_path=config_path)
 
-    # Auto-initialize and start
+    # Auto-initialize: open camera + start detection
     try:
         controller.initialize()
-        controller.start()
         window.start_preview()
         logger.info("LarkSnap started successfully")
     except Exception as e:
@@ -81,6 +86,7 @@ def run_with_qt(config_path: str | None) -> None:
     exit_code = app.exec()
 
     controller.stop()
+    atexit.unregister(controller.stop)
     logger.info("LarkSnap exited (code=%d)", exit_code)
     sys.exit(exit_code)
 
@@ -103,7 +109,6 @@ def run_with_tray(config_path: str | None) -> None:
 
     controller = GatewayController(config)
     controller.initialize()
-    controller.start()
 
     tray = SystemTray(controller)
 

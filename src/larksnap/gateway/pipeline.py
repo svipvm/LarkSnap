@@ -121,7 +121,9 @@ class Pipeline:
         if self._running:
             return
 
-        self._zmq_context = zmq.Context.instance()
+        # Use a dedicated ZMQ context (not the global singleton)
+        # so we can safely terminate it on stop without affecting other users.
+        self._zmq_context = zmq.Context()
         policy = FrameQueuePolicy(self._config.frame_queue_policy)
 
         # Start ZMQ result publisher
@@ -135,6 +137,7 @@ class Pipeline:
             policy=policy,
             hwm=self._config.frame_queue_hwm,
         )
+        self._producer.set_on_fatal_error(self._on_producer_fatal_error)
         self._producer.start(context=self._zmq_context)
 
         # Start detector consumer (ZMQ → detector → result publisher)
@@ -175,6 +178,7 @@ class Pipeline:
 
         self._running = False
 
+        # Stop all components (closes their ZMQ sockets)
         if self._producer is not None:
             self._producer.stop()
         if self._detector_consumer is not None:
@@ -191,6 +195,11 @@ class Pipeline:
         self._preview_consumer = None
         self._result_subscriber = None
         self._result_publisher = None
+
+        # Terminate ZMQ context to ensure all associated threads exit
+        if self._zmq_context is not None:
+            self._zmq_context.term()
+            self._zmq_context = None
 
         self._logger.info("Pipeline stopped")
 
@@ -254,6 +263,21 @@ class Pipeline:
             self._latest_frame = packet.frame.copy()
 
         self._event_bus.publish(Event(type=EventType.FRAME_CAPTURED, source="camera"))
+
+    def _on_producer_fatal_error(self, error_message: str) -> None:
+        """Handle fatal camera read errors from FrameProducer.
+
+        Called when the producer stops itself after too many consecutive failures.
+        Publishes an event and stops the pipeline.
+        """
+        self._logger.error("Frame producer fatal error: %s", error_message)
+        self._event_bus.publish(Event(
+            type=EventType.CAMERA_READ_FAILED,
+            data={"error": error_message},
+            source="pipeline",
+        ))
+        # Stop the pipeline since we can't produce frames
+        self.stop()
 
     def _on_detection_result(self, topic: str, data: dict) -> None:
         """Handle detection results from ZMQ subscriber → notification callback."""

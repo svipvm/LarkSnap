@@ -10,6 +10,21 @@ from larksnap.config.models import CameraConfig
 from larksnap.utils.exceptions import CameraError
 
 
+def enumerate_cameras(max_index: int = 10) -> list[int]:
+    """Detect available camera device indices.
+
+    Probes indices 0..max_index-1 by attempting to open each briefly.
+    Returns a list of indices that successfully open.
+    """
+    available: list[int] = []
+    for idx in range(max_index):
+        cap = cv2.VideoCapture(idx)
+        if cap.isOpened():
+            available.append(idx)
+            cap.release()
+    return available
+
+
 @camera_registry.register("opencv")
 class OpenCVCameraAdapter(CameraAdapter):
     """OpenCV-based camera adapter for local webcam capture."""

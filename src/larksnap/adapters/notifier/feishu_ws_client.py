@@ -94,9 +94,13 @@ class FeishuWSClient:
     def stop(self) -> None:
         """Stop the WebSocket client."""
         self._running = False
-        # lark-oapi ws.Client does not expose a clean shutdown API,
-        # so we rely on the daemon thread being terminated when the
-        # process exits.
+        # lark-oapi ws.Client does not expose a clean shutdown API.
+        # Set the client reference to None and rely on the daemon thread
+        # being terminated when the process exits.
+        self._client = None
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=3.0)
+        self._thread = None
         self._logger.info("Feishu WS client stopped")
 
     def _run(self) -> None:
