@@ -4,19 +4,32 @@ Composes Pipeline, NotificationService, and Recorder.
 Delegates all domain logic to specialized modules.
 
 State machine:
-  IDLE        → open_camera()   → CAMERA_ON
-  CAMERA_ON   → close_camera()  → IDLE
-  CAMERA_ON   → start_detection() → DETECTING
-  DETECTING   → stop_detection()  → CAMERA_ON
-  DETECTING   → pause()        → DET_PAUSED
-  DET_PAUSED  → resume()       → DETECTING
-  DET_PAUSED  → stop_detection()  → CAMERA_ON
-  CAMERA_ON/DETECTING/DET_PAUSED → close_camera() → IDLE
+  IDLE        → open_camera()   → CAMERA_ON     (preview running, detection off)
+  CAMERA_ON   → start_detection() → DETECTING   (preview running, detection active)
+  DETECTING   → stop_detection()  → CAMERA_ON   (preview running, detection off)
+  CAMERA_ON/DETECTING → close_camera() → IDLE
+
+Concurrency contract:
+  - State is mutated only under ``self._state_lock`` (an RLock so a
+    state method may call another one).
+  - Adapters, pipeline, and the WS client are created/destroyed only
+    on the thread that calls ``open_camera`` / ``close_camera``. The
+    main window always invokes these from the Qt main thread, so the
+    "owning thread" for the pipeline is the Qt main thread.
+  - The pipeline's background threads (FrameProducer, FrameConsumer,
+    ResultSubscriber) run on their own Python threads and only
+    communicate with the controller via ``EventBus`` events.
+  - Long-running close operations are dispatched to a one-shot
+    background thread so the Qt main loop stays responsive.
 """
 
 from __future__ import annotations
 
+import enum
 import logging
+import threading
+import time
+from typing import Any, Callable
 
 from larksnap.adapters.camera.interface import CameraAdapter
 from larksnap.adapters.detector.interface import DetectionResult, DetectorAdapter
@@ -26,10 +39,73 @@ from larksnap.adapters.notifier.interface import NotifierAdapter
 from larksnap.adapters.recorder.video_recorder import VideoRecorderAdapter
 from larksnap.adapters.registry import camera_registry, detector_registry, notifier_registry
 from larksnap.config.models import AppConfig
+from larksnap.config.state_persistence import (
+    PersistedRuntimeState,
+    default_state_path,
+    load_state,
+    save_state,
+)
+from larksnap.gateway.component_state import (
+    ComponentKind,
+    ComponentState,
+    ComponentStatus,
+    SystemStatus,
+    component_state_from_legacy,
+)
 from larksnap.gateway.event_bus import Event, EventBus, EventType
 from larksnap.gateway.notification_service import NotificationService, NotificationServiceConfig
 from larksnap.gateway.pipeline import Pipeline, PipelineConfig
 from larksnap.utils.exceptions import CameraError, GatewayError
+from larksnap.utils.worker_pool import WorkerPool
+
+# Type alias for event handlers (mirrors the one in event_bus.py).
+EventHandler = Callable[["Event"], None]
+
+
+class GatewayState(enum.Enum):
+    """Atomic gateway state.
+
+    All public state queries (``is_camera_open``, ``is_running``, ...)
+    read this enum under ``_state_lock``. All state transitions go
+    through ``_set_state`` which validates the transition.
+    """
+
+    IDLE = "idle"               # no camera, no pipeline
+    OPENING = "opening"         # camera init in progress (used internally)
+    CLOSING = "closing"         # camera teardown in progress (used internally)
+    CAMERA_ON = "camera_on"     # pipeline running, detection off
+    DETECTING = "detecting"     # pipeline running, detection active
+
+
+# State transitions that are allowed. ``CLOSING`` and ``OPENING`` are
+# transient internal states — public methods never return them.
+_ALLOWED_TRANSITIONS: dict[GatewayState, frozenset[GatewayState]] = {
+    GatewayState.IDLE:        frozenset({GatewayState.OPENING}),
+    GatewayState.OPENING:     frozenset({GatewayState.CAMERA_ON, GatewayState.IDLE}),
+    GatewayState.CAMERA_ON:   frozenset({GatewayState.DETECTING, GatewayState.CLOSING}),
+    GatewayState.DETECTING:   frozenset({GatewayState.CAMERA_ON, GatewayState.CLOSING}),
+    GatewayState.CLOSING:     frozenset({GatewayState.IDLE}),
+}
+
+
+def _safe_release_adapter(adapter: Any, logger: logging.Logger) -> None:
+    """Best-effort adapter stop+release. Never raises.
+
+    Production-grade teardown must not propagate exceptions from one
+    adapter's cleanup into another's. We log and continue.
+    """
+    if adapter is None:
+        return
+    try:
+        if hasattr(adapter, "stop") and callable(adapter.stop):
+            adapter.stop()
+    except Exception as e:  # noqa: BLE001 — cleanup path, log all
+        logger.error("Adapter stop failed: %s", e)
+    try:
+        if hasattr(adapter, "release") and callable(adapter.release):
+            adapter.release()
+    except Exception as e:  # noqa: BLE001
+        logger.error("Adapter release failed: %s", e)
 
 
 class GatewayController:
@@ -41,10 +117,42 @@ class GatewayController:
       - Closing camera automatically stops detection
     """
 
-    def __init__(self, config: AppConfig, event_bus: EventBus | None = None) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        event_bus: EventBus | None = None,
+        state_path: "Path | None" = None,
+    ) -> None:
+        # Defer the typing import — Path is in the local module
+        # scope, no need to widen the module's typing imports.
+        from pathlib import Path as _Path
+
         self._config = config
         self._event_bus = event_bus or EventBus()
         self._logger = logging.getLogger("larksnap.gateway")
+        # Where the detector/notifier on/off state is persisted
+        # across camera close/open cycles. ``None`` means "use the
+        # default user-data path".
+        self._state_path: _Path | None = (
+            _Path(state_path) if state_path is not None else default_state_path()
+        )
+
+        # Pre-compute the per-instance inproc URLs so the recorder
+        # (created in _create_adapters) and the pipeline (created
+        # later) agree on the same endpoints. Using a uuid suffix
+        # avoids the "Address in use" error that the fixed
+        # ``Pipeline.FRAME_QUEUE_URL`` would produce on the second
+        # open/close cycle when the previous producer's inproc
+        # endpoint is still being torn down inside the singleton
+        # ZMQ context.
+        import uuid
+        self._instance_id = uuid.uuid4().hex[:8]
+        self._frame_queue_url = (
+            f"inproc://larksnap_frame_queue_{self._instance_id}"
+        )
+        self._result_queue_url = (
+            f"inproc://larksnap_detection_results_{self._instance_id}"
+        )
 
         # Adapters (created in _create_adapters())
         self._camera: CameraAdapter | None = None
@@ -57,34 +165,153 @@ class GatewayController:
         self._pipeline: Pipeline | None = None
         self._notification_service: NotificationService | None = None
 
-        # State
-        self._camera_open = False
-        self._detection_running = False
-        self._detection_paused = False
+        # Bounded worker pool for offloading blocking I/O. The ZMQ
+        # result-subscriber thread (which fires the notification
+        # callback) and any other "fast loop" must never block on
+        # HTTP calls or disk writes; those are pushed here.
+        self._worker_pool: WorkerPool = WorkerPool(
+            max_workers=4,
+            queue_size=128,
+            name_prefix="larksnap-gw",
+        )
+
+        # State — all access goes through _state_lock. We keep the
+        # individual booleans as a *cache* of the state enum for
+        # backwards-compatible property semantics.
+        self._state_lock = threading.RLock()
+        self._state: GatewayState = GatewayState.IDLE
         self._camera_failed = False
+
+        # Tracked event-bus subscriptions so re-opening the camera
+        # doesn't pile up duplicate handlers. Key: (EventType, handler_id).
+        self._subscriptions: set[tuple[EventType, int]] = set()
+
+        # One-shot thread used for non-blocking close. We protect the
+        # start of a new close thread with a lock so concurrent
+        # ``close_camera()`` calls (e.g. double-clicks) can't race
+        # against each other and either spawn a second close thread
+        # or clear the done event while another thread is waiting on
+        # it. ``_close_thread_lock`` and ``_close_done`` are only
+        # touched while holding ``_state_lock`` (to keep ordering
+        # guarantees simple) but the lock is its own RLock so
+        # ``wait_closed`` can take it independently.
+        self._close_thread_lock = threading.RLock()
+        self._close_thread: threading.Thread | None = None
+        self._close_done = threading.Event()
 
         # Ensure adapter modules are imported
         self._ensure_adapters_registered()
 
+    # ── State helpers (must be called under _state_lock) ──────────────
+
+    def _set_state(self, new_state: GatewayState) -> bool:
+        """Atomic state transition with validation.
+
+        Returns True if the transition was allowed, False if rejected
+        (e.g. a duplicate open_camera() call while already opening).
+        """
+        with self._state_lock:
+            allowed = _ALLOWED_TRANSITIONS.get(self._state, frozenset())
+            if new_state not in allowed:
+                self._logger.debug(
+                    "Rejecting state transition %s → %s (not allowed)",
+                    self._state.value, new_state.value,
+                )
+                return False
+            old = self._state
+            self._state = new_state
+            if old is not new_state:
+                self._logger.info("State: %s → %s", old.value, new_state.value)
+            return True
+
+    def _get_state(self) -> GatewayState:
+        with self._state_lock:
+            return self._state
+
+    def _publish_component_state(self, *kinds: ComponentKind) -> None:
+        """Publish ``COMPONENT_STATE_CHANGED`` for each given subsystem.
+
+        Centralised so every transition (camera open, detection
+        start/stop, notifier toggle) emits a single, consistent
+        event with the freshest snapshot. UI listeners can rely on
+        this event to keep the status panel, menu checkboxes, and
+        tray icon in lock-step with the backend without polling.
+
+        Exceptions are swallowed (and logged) because publishing is a
+        best-effort notification — a failed publish must not undo a
+        successful state transition.
+        """
+        for kind in kinds:
+            try:
+                status = self.get_component_status(kind)
+                self._event_bus.publish(Event(
+                    type=EventType.COMPONENT_STATE_CHANGED,
+                    data=status,
+                    source="gateway",
+                ))
+            except Exception as e:  # noqa: BLE001
+                self._logger.error(
+                    "Failed to publish component state for %s: %s",
+                    kind.value, e,
+                )
+
+    def _subscribe(self, event_type: EventType, handler: EventHandler) -> None:
+        """Subscribe ``handler`` to ``event_type`` exactly once.
+
+        Naive repeated ``event_bus.subscribe`` calls would stack the
+        same handler N times after N open/close cycles, causing N
+        callback invocations per event. Track subscriptions in a set
+        and skip duplicates.
+
+        The key uses ``id(underlying func)`` rather than ``id(handler)``
+        because bound-method objects get a fresh ``id`` on every
+        attribute access, which would defeat the dedup.
+        """
+        # For bound methods, use the underlying function's id; for
+        # plain functions/lambdas, use the handler's id directly.
+        func = getattr(handler, "__func__", handler)
+        key = (event_type, id(func))
+        if key in self._subscriptions:
+            return
+        self._event_bus.subscribe(event_type, handler)
+        self._subscriptions.add(key)
+
     # ── Public Properties ─────────────────────────────────────────────
 
     @property
+    def state(self) -> GatewayState:
+        """Current gateway state (thread-safe)."""
+        return self._get_state()
+
+    @property
     def is_camera_open(self) -> bool:
-        return self._camera_open
+        """True when the camera is open and the pipeline is running.
+
+        Includes CAMERA_ON and DETECTING — anything where the camera
+        is actively producing frames.
+        """
+        s = self._get_state()
+        return s in (GatewayState.CAMERA_ON, GatewayState.DETECTING)
 
     @property
     def is_running(self) -> bool:
-        """Detection is running (not paused)."""
-        return self._detection_running and not self._detection_paused
+        """Detection is running (camera open and detection active)."""
+        return self._get_state() == GatewayState.DETECTING
 
     @property
     def is_detection_active(self) -> bool:
-        """Detection pipeline is active (running or paused)."""
-        return self._detection_running
+        """Detection pipeline is active."""
+        return self._get_state() == GatewayState.DETECTING
 
     @property
-    def is_paused(self) -> bool:
-        return self._detection_paused
+    def is_busy(self) -> bool:
+        """True while a camera open/close operation is in flight.
+
+        The UI uses this to disable menu items during transitions and
+        to display a loading overlay so the window doesn't look frozen.
+        """
+        s = self._get_state()
+        return s in (GatewayState.OPENING, GatewayState.CLOSING)
 
     @property
     def is_recording(self) -> bool:
@@ -104,7 +331,94 @@ class GatewayController:
 
     @property
     def notification_enabled(self) -> bool:
-        return self._notification_service.notification_enabled if self._notification_service else False
+        """Deprecated alias for :py:meth:`is_notification_enabled`.
+
+        Kept so existing callers and tests don't break; new code
+        should use the ``is_*`` form to match the other state
+        properties (``is_camera_open``, ``is_running`` etc.).
+        """
+        return self.is_notification_enabled
+
+    @property
+    def is_notification_enabled(self) -> bool:
+        """True if the notification dispatch is currently enabled.
+
+        The notifier can be enabled even when the camera is closed —
+        the ``/start`` and ``/stop`` Feishu commands toggle this
+        regardless of camera state.
+        """
+        ns = self._notification_service
+        if ns is None:
+            return False
+        return ns.is_notification_enabled
+
+    def get_component_status(
+        self, kind: ComponentKind
+    ) -> ComponentStatus:
+        """Return the unified status of one subsystem.
+
+        Centralises the mapping from the controller's existing
+        booleans onto a single ``ComponentStatus`` so the UI doesn't
+        have to know about each subsystem's internal flags.
+        """
+        # Snapshot everything under the state lock so the returned
+        # status is consistent even if a transition is in flight.
+        with self._state_lock:
+            gateway_state = self._state
+            camera_failed = self._camera_failed
+            is_busy = gateway_state in (
+                GatewayState.OPENING,
+                GatewayState.CLOSING,
+            )
+            cam_open = gateway_state in (
+                GatewayState.CAMERA_ON,
+                GatewayState.DETECTING,
+            )
+
+        if kind is ComponentKind.CAMERA:
+            camera_state = component_state_from_legacy(
+                is_open=cam_open,
+                is_busy=is_busy and gateway_state == GatewayState.OPENING,
+                is_running=cam_open and gateway_state != GatewayState.OPENING,
+                is_failed=camera_failed,
+            )
+            return ComponentStatus(
+                kind=kind,
+                state=camera_state,
+                detail=("最近一次初始化失败" if camera_failed else None),
+            )
+
+        if kind is ComponentKind.DETECTOR:
+            detector_state = component_state_from_legacy(
+                is_open=gateway_state == GatewayState.DETECTING,
+                is_busy=is_busy,
+                is_running=gateway_state == GatewayState.DETECTING,
+                is_failed=False,
+            )
+            return ComponentStatus(kind=kind, state=detector_state)
+
+        if kind is ComponentKind.NOTIFIER:
+            notif_on = self.is_notification_enabled
+            notif_state = (
+                ComponentState.DISABLED
+                if not notif_on
+                else component_state_from_legacy(
+                    is_open=notif_on,
+                    is_busy=False,
+                    is_running=notif_on,
+                )
+            )
+            return ComponentStatus(kind=kind, state=notif_state)
+
+        raise ValueError(f"Unknown component kind: {kind!r}")
+
+    def get_system_status(self) -> SystemStatus:
+        """Return a snapshot of all three subsystem states at once."""
+        return SystemStatus(
+            camera=self.get_component_status(ComponentKind.CAMERA),
+            detector=self.get_component_status(ComponentKind.DETECTOR),
+            notifier=self.get_component_status(ComponentKind.NOTIFIER),
+        )
 
     def get_latest_frame(self):
         return self._pipeline.get_latest_frame() if self._pipeline else None
@@ -115,14 +429,54 @@ class GatewayController:
     # ── Camera Lifecycle ──────────────────────────────────────────────
 
     def open_camera(self, device_index: int | None = None) -> None:
-        """Open camera and start preview. Optionally switch device index."""
-        if self._camera_open:
-            if device_index is not None and device_index != self._config.camera.device_index:
-                # Switch camera: close current, reopen with new index
-                self.close_camera()
-            else:
-                self._logger.warning("Camera is already open")
+        """Open camera and start the preview pipeline.
+
+        The pipeline is started immediately (in ``CAMERA_ON`` state) so
+        the UI sees frames right away. Detection is controlled by
+        ``start_detection()`` / ``stop_detection()``. This fixes the
+        "camera open but no frames" issue.
+
+        Reentrant: calling this while already open with the same
+        device is a no-op; calling with a different device triggers a
+        close+reopen cycle.
+
+        Runs synchronously on the calling thread, but the expensive
+        ZMQ/pipeline start is bounded — if it ever blocks, the UI
+        thread will at worst experience a brief pause, not a hang,
+        because every ZMQ operation has a timeout.
+        """
+        with self._state_lock:
+            current = self._state
+            if current in (GatewayState.OPENING, GatewayState.CLOSING):
+                self._logger.warning(
+                    "Camera operation already in progress (state=%s); ignoring open_camera",
+                    current.value,
+                )
                 return
+            if current in (GatewayState.CAMERA_ON, GatewayState.DETECTING):
+                if device_index is not None and device_index != self._config.camera.device_index:
+                    # Switch camera: close current, reopen with new index.
+                    # Release the lock so close_camera() can take it.
+                    target_device = device_index
+                else:
+                    self._logger.warning("Camera is already open")
+                    return
+            else:
+                target_device = device_index
+
+        # Switch path: close then reopen on the same caller's thread.
+        if current in (GatewayState.CAMERA_ON, GatewayState.DETECTING) \
+                and device_index is not None and device_index != self._config.camera.device_index:
+            self._config.camera.device_index = target_device  # type: ignore[has-type]
+            # Close blocks this thread; safe because it is the UI thread
+            # and the close path is bounded by timeouts.
+            self.close_camera()
+            self.open_camera()
+            return
+
+        # Normal open path
+        if not self._set_state(GatewayState.OPENING):
+            return
 
         try:
             self._logger.info("Opening camera...")
@@ -143,6 +497,7 @@ class GatewayController:
                 ))
                 self._camera_failed = True
                 self._release_adapters()
+                self._set_state(GatewayState.IDLE)
                 raise
 
             self._camera_failed = False
@@ -161,7 +516,7 @@ class GatewayController:
                 config=pipeline_config,
                 event_bus=self._event_bus,
             )
-            self._event_bus.subscribe(EventType.CAMERA_READ_FAILED, self._on_pipeline_fatal_error)
+            self._subscribe(EventType.CAMERA_READ_FAILED, self._on_pipeline_fatal_error)
 
             # Compose NotificationService
             notif_config = NotificationServiceConfig(
@@ -173,10 +528,11 @@ class GatewayController:
                 config=notif_config,
                 notifier=self._notifier,
                 event_bus=self._event_bus,
+                worker_pool=self._worker_pool,
             )
             self._pipeline.set_on_results(self._notification_service.handle_results)
 
-            # Start WebSocket command listener
+            # Start WebSocket command listener (process-lifetime singleton)
             if self._config.notifier.app_id and self._config.notifier.app_secret:
                 self._init_ws_client()
 
@@ -188,103 +544,286 @@ class GatewayController:
                     source="gateway",
                 ))
 
-            self._camera_open = True
+            # ── PRIMARY FIX: start the pipeline NOW so preview frames
+            # flow in CAMERA_ON state. Detection runs from the moment
+            # the camera opens, so no separate start step is needed.
+            self._pipeline.start()
+
+            if not self._set_state(GatewayState.CAMERA_ON):
+                # Unexpected: someone else moved the state. Roll back.
+                self._logger.error(
+                    "State transition to CAMERA_ON rejected (was %s) — rolling back",
+                    self._state.value,
+                )
+                self._release_adapters()
+                self._set_state(GatewayState.IDLE)
+                raise GatewayError("Failed to enter CAMERA_ON state")
+
             self._event_bus.publish(Event(type=EventType.CAMERA_OPENED, source="gateway"))
+            # Publish the unified component state so the status
+            # panel and menu checkboxes update in lock-step.
+            self._publish_component_state(
+                ComponentKind.CAMERA, ComponentKind.DETECTOR, ComponentKind.NOTIFIER,
+            )
+            # Restore the detector + notifier on/off state from the
+            # previous session. Done after CAMERA_OPENED so the UI
+            # has subscribed to the event bus and will see the
+            # subsequent detector / notifier state events.
+            self._restore_runtime_state()
             self._logger.info("Camera opened (device %d)", self._config.camera.device_index)
 
         except Exception as e:
+            # Make sure we always end up in IDLE on failure
             self._release_adapters()
+            with self._state_lock:
+                if self._state in (GatewayState.OPENING, GatewayState.CAMERA_ON):
+                    self._state = GatewayState.IDLE
             raise GatewayError(f"Failed to open camera: {e}") from e
 
     def close_camera(self) -> None:
-        """Close camera and release all resources. Stops detection if running."""
-        if not self._camera_open:
+        """Close camera and release all resources. Stops detection if running.
+
+        Implemented as a non-blocking state transition: the calling
+        thread (typically the Qt main thread) only flips the state to
+        ``CLOSING`` and starts a background daemon to do the actual
+        teardown. The background thread publishes ``CAMERA_CLOSED``
+        when done, which the UI listens for via the event bridge.
+
+        Concurrency: two near-simultaneous ``close_camera()`` calls
+        (e.g. the user double-clicks the close button, or the fatal
+        error handler and the user both try to close at once) are
+        serialised by ``_close_thread_lock`` so exactly one close
+        thread runs. The second call is a no-op that returns
+        immediately; callers that need a "fully closed" signal must
+        use ``wait_closed()``.
+
+        This eliminates the multi-second UI freezes that occurred when
+        ZMQ socket closes, thread joins, and context termination all
+        ran synchronously on the main thread.
+
+        Note: The Feishu WebSocket command client is intentionally NOT
+        stopped here. The lark-oapi SDK's ``ws.Client.start()`` is a
+        blocking call that owns an asyncio event loop with no public
+        stop API. Restarting it on every camera open/close cycle causes
+        ``RuntimeError: This event loop is already running`` and
+        ``coroutine was never awaited`` warnings because the SDK has
+        module-level singleton state that gets corrupted across
+        instances. The WS client is started once (lazily, on first
+        ``open_camera``) and torn down once on process exit via
+        ``stop()``.
+        """
+        with self._close_thread_lock:
+            with self._state_lock:
+                # If we're already in CLOSING and a thread is still
+                # alive, this call is a duplicate; do nothing.
+                if self._state == GatewayState.CLOSING:
+                    if self._close_thread is not None and self._close_thread.is_alive():
+                        return
+                    # Otherwise a previous close thread finished but
+                    # the state was left at CLOSING (defensive).
+                if self._state == GatewayState.IDLE:
+                    return
+                # Capture the on/off state of the detector + notifier
+                # BEFORE flipping the state to CLOSING. Done under
+                # the state lock and on the calling thread so we read
+                # the user's current intent (DETECTING / CAMERA_ON),
+                # not the transient CLOSING value. The background
+                # worker runs later, by which time the state has
+                # already moved on.
+                self._capture_and_persist_runtime_state()
+                if not self._set_state(GatewayState.CLOSING):
+                    return
+
+            # Reset the done event and start the background teardown.
+            # Done under ``_close_thread_lock`` so a second
+            # ``close_camera()`` can't race us into clearing an event
+            # that another thread is about to wait on. Without the
+            # lock, a waiter that started after the previous close
+            # completed could see the stale "True" and miss the new
+            # close entirely.
+            self._close_done.clear()
+            self._close_thread = threading.Thread(
+                target=self._close_camera_worker,
+                name="GatewayController-close",
+                daemon=True,
+            )
+            self._close_thread.start()
+
+    def _close_camera_worker(self) -> None:
+        """Background worker: do the actual teardown.
+
+        Uses timeouts on every blocking operation. Any exception is
+        logged and swallowed — we MUST reach the IDLE state so the
+        gateway can be reopened.
+        """
+        try:
+            self._logger.info("Closing camera (background)...")
+
+            # Stop recording first (fast, in-process)
+            if self._recorder is not None and self._recorder.is_recording:
+                try:
+                    self._recorder.stop_recording()
+                except Exception as e:
+                    self._logger.error("Stop recording during close failed: %s", e)
+
+            # Stop pipeline (this may take a few seconds for ZMQ cleanup)
+            if self._pipeline is not None:
+                try:
+                    self._pipeline.stop()
+                except Exception as e:
+                    self._logger.error("Pipeline stop during close failed: %s", e)
+
+            # Release adapters (best-effort, never raises)
+            try:
+                self._release_adapters()
+            except Exception as e:
+                self._logger.error("Adapter release during close failed: %s", e)
+
+            with self._state_lock:
+                self._state = GatewayState.IDLE
+
+            try:
+                self._event_bus.publish(Event(type=EventType.CAMERA_CLOSED, source="gateway"))
+                # Publish unified component state so the UI panel
+                # and menu reflect the new camera/detector state.
+                self._publish_component_state(
+                    ComponentKind.CAMERA, ComponentKind.DETECTOR,
+                )
+            except Exception as e:
+                self._logger.error("Publish CAMERA_CLOSED failed: %s", e)
+
+            self._logger.info("Camera closed")
+        finally:
+            self._close_done.set()
+
+    def _capture_and_persist_runtime_state(self) -> None:
+        """Snapshot detector + notifier state and write it to disk.
+
+        Called from the close-camera worker, BEFORE the pipeline
+        and notification service are released, so the source of
+        truth is still live. Best-effort: any error is logged but
+        does not abort the close.
+        """
+        try:
+            detector_running = self._state == GatewayState.DETECTING
+            notifier_enabled = (
+                self._notification_service.is_notification_enabled
+                if self._notification_service is not None
+                else True
+            )
+            save_state(
+                PersistedRuntimeState(
+                    detector_running=detector_running,
+                    notifier_enabled=notifier_enabled,
+                ),
+                self._state_path,
+            )
+        except Exception as e:  # noqa: BLE001 — best-effort
+            self._logger.error("Failed to capture runtime state: %s", e)
+
+    def _restore_runtime_state(self) -> None:
+        """Read the persisted state and apply it to the live components.
+
+        Called from open_camera() AFTER the pipeline and
+        notification service are created. If no persisted state is
+        available, or the file is unreadable, we fall back to the
+        natural defaults (detection running, notifier enabled) so
+        the user's first run is unchanged.
+
+        The user-visible effect is seamless: the menu checkboxes
+        and status panel jump straight to the saved state via the
+        component-state event published by each method below, so
+        no "re-initialising" flash appears.
+        """
+        persisted = load_state(self._state_path)
+        if persisted is None:
             return
+        # Apply detector state first (sets the gateway state enum),
+        # then notifier state (independent of the pipeline).
+        if persisted.detector_running and self._state == GatewayState.CAMERA_ON:
+            try:
+                self.start_detection()
+            except Exception as e:  # noqa: BLE001 — best-effort
+                self._logger.error("Failed to restore detector state: %s", e)
+        elif not persisted.detector_running and self._state == GatewayState.DETECTING:
+            try:
+                self.stop_detection()
+            except Exception as e:  # noqa: BLE001 — best-effort
+                self._logger.error("Failed to restore detector state: %s", e)
+        # Notifier state. We always have a notification service at
+        # this point because open_camera() created one before calling
+        # this method.
+        if self._notification_service is not None:
+            try:
+                if persisted.notifier_enabled:
+                    self._notification_service.enable_notification()
+                else:
+                    self._notification_service.disable_notification()
+            except Exception as e:  # noqa: BLE001 — best-effort
+                self._logger.error("Failed to restore notifier state: %s", e)
 
-        # Stop detection first if running
-        if self._detection_running:
-            self._stop_detection_internal()
+    def wait_closed(self, timeout: float = 5.0) -> bool:
+        """Block until a pending close operation finishes.
 
-        # Stop recording if active
-        if self._recorder is not None and self._recorder.is_recording:
-            self._recorder.stop_recording()
-
-        # Stop WS client
-        if self._ws_client is not None:
-            self._ws_client.stop()
-            self._ws_client = None
-
-        self._camera_open = False
-        self._detection_running = False
-        self._detection_paused = False
-
-        self._release_adapters()
-        self._event_bus.publish(Event(type=EventType.CAMERA_CLOSED, source="gateway"))
-        self._logger.info("Camera closed")
+        Returns True if the close completed within ``timeout`` seconds,
+        False otherwise. Safe to call when no close is in progress
+        (returns True immediately). Safe to call concurrently — the
+        event is created once and never replaced.
+        """
+        if not self.is_busy:
+            return True
+        return self._close_done.wait(timeout)
 
     # ── Detection Lifecycle ───────────────────────────────────────────
 
     def start_detection(self) -> None:
-        """Start detection pipeline. Camera must be open."""
-        if not self._camera_open:
-            raise GatewayError("Camera must be open before starting detection")
-        if self._detection_running:
-            self._logger.warning("Detection is already running")
-            return
+        """Start detection (resume the paused pipeline). Camera must be open."""
+        with self._state_lock:
+            current = self._state
+            if current == GatewayState.IDLE:
+                raise GatewayError("Camera must be open before starting detection")
+            if current in (GatewayState.OPENING, GatewayState.CLOSING):
+                self._logger.warning(
+                    "Cannot start detection while camera is %s", current.value,
+                )
+                return
+            if current == GatewayState.DETECTING:
+                self._logger.warning("Detection is already running")
+                return
+            if not self._set_state(GatewayState.DETECTING):
+                return
 
-        self._pipeline.start()
-        self._detection_running = True
-        self._detection_paused = False
+        if self._pipeline is not None:
+            self._pipeline.resume()
         self._event_bus.publish(Event(type=EventType.DETECTION_STARTED, source="gateway"))
+        self._publish_component_state(ComponentKind.DETECTOR)
         self._logger.info("Detection started")
 
     def stop_detection(self) -> None:
-        """Stop detection pipeline. Camera stays open for preview."""
-        if not self._detection_running:
-            return
-        self._stop_detection_internal()
+        """Stop detection (pause the pipeline). Camera stays open for preview.
 
-    def _stop_detection_internal(self) -> None:
-        """Internal: stop detection pipeline and update state."""
+        Unlike the previous implementation, we do NOT tear down and
+        recreate the pipeline. Detection is simply paused — the
+        camera and preview keep running. This is much cheaper and
+        avoids the ZMQ close/reopen cycle that caused re-open bugs.
+        """
+        with self._state_lock:
+            current = self._state
+            if current != GatewayState.DETECTING:
+                return
+            if not self._set_state(GatewayState.CAMERA_ON):
+                return
+
         if self._pipeline is not None:
-            self._pipeline.stop()
-
-        # Recreate pipeline (it can't be restarted after stop)
-        pipeline_config = PipelineConfig(
-            frame_queue_hwm=self._config.gateway.frame_queue_hwm,
-            frame_queue_policy=self._config.gateway.frame_queue_policy,
-        )
-        self._pipeline = Pipeline(
-            camera=self._camera,
-            detector=self._detector,
-            config=pipeline_config,
-            event_bus=self._event_bus,
-        )
-        self._event_bus.subscribe(EventType.CAMERA_READ_FAILED, self._on_pipeline_fatal_error)
-        if self._notification_service is not None:
-            self._pipeline.set_on_results(self._notification_service.handle_results)
-
-        self._detection_running = False
-        self._detection_paused = False
-        self._event_bus.publish(Event(type=EventType.DETECTION_STOPPED, source="gateway"))
-        self._logger.info("Detection stopped")
-
-    def pause(self) -> None:
-        if self._pipeline is not None and self._detection_running and not self._detection_paused:
             self._pipeline.pause()
-            self._detection_paused = True
-            self._event_bus.publish(Event(type=EventType.DETECTION_PAUSED, source="gateway"))
-
-    def resume(self) -> None:
-        if self._pipeline is not None and self._detection_running and self._detection_paused:
-            self._pipeline.resume()
-            self._detection_paused = False
-            self._event_bus.publish(Event(type=EventType.DETECTION_RESUMED, source="gateway"))
+        self._event_bus.publish(Event(type=EventType.DETECTION_STOPPED, source="gateway"))
+        self._publish_component_state(ComponentKind.DETECTOR)
+        self._logger.info("Detection stopped")
 
     # ── Recording ─────────────────────────────────────────────────────
 
     def start_recording(self) -> None:
-        if self._recorder is not None and self._detection_running:
+        if self._recorder is not None and self.is_detection_active:
             self._recorder.start_recording(context=None)
 
     def stop_recording(self) -> None:
@@ -306,26 +845,64 @@ class GatewayController:
     def initialize(self) -> None:
         """Legacy: open camera + start detection."""
         self.open_camera()
-        self.start_detection()
+        # Only start detection if open_camera succeeded
+        if self.is_camera_open:
+            self.start_detection()
 
     def start(self) -> None:
         """Legacy: start detection if camera is open."""
-        if self._camera_open and not self._detection_running:
+        if self.is_camera_open and not self.is_detection_active:
             self.start_detection()
 
     def stop(self) -> None:
-        """Legacy: close camera (stops everything)."""
-        self.close_camera()
+        """Legacy: close camera (stops everything).
+
+        On process exit this is the one place that tears down the WS
+        client AND the background worker pool. Camera open/close
+        cycles intentionally do not stop the WS client (see
+        ``close_camera`` docstring).
+
+        Waits for any in-flight close to finish (bounded) so callers
+        that need to know "everything is stopped" get a deterministic
+        answer.
+        """
+        if self.is_camera_open or self.is_busy:
+            self.close_camera()
+            self.wait_closed(timeout=5.0)
+        if self._ws_client is not None:
+            try:
+                self._ws_client.stop()
+            except Exception as e:
+                self._logger.error("WS client stop failed: %s", e)
+            self._ws_client = None
+        # Shutdown the worker pool last so any straggler tasks
+        # dispatched by the closing pipeline have a chance to run.
+        try:
+            self._worker_pool.shutdown(timeout=2.0)
+        except Exception as e:  # noqa: BLE001
+            self._logger.error("Worker pool shutdown failed: %s", e)
 
     # ── Event handlers ────────────────────────────────────────────────
 
     def _on_pipeline_fatal_error(self, event: Event) -> None:
-        """Handle pipeline fatal error — sync controller state."""
+        """Handle pipeline fatal error — initiate non-blocking close.
+
+        The pipeline ran out of retries while reading frames. The
+        correct response is to take the gateway to IDLE so the user
+        can re-open the camera. We dispatch the actual teardown to
+        the same background path as ``close_camera`` to keep the
+        main thread responsive.
+        """
         self._logger.error("Pipeline stopped due to fatal error: %s", event.data)
-        self._detection_running = False
-        self._detection_paused = False
-        self._camera_open = False
-        self._event_bus.publish(Event(type=EventType.CAMERA_READ_FAILED, data=event.data, source="gateway"))
+        self._event_bus.publish(Event(
+            type=EventType.CAMERA_READ_FAILED,
+            data=event.data,
+            source="gateway",
+        ))
+        # Trigger a non-blocking close. If a close is already in
+        # progress this is a no-op.
+        if self.is_camera_open:
+            self.close_camera()
 
     # ── Private ────────────────────────────────────────────────────────
 
@@ -352,10 +929,20 @@ class GatewayController:
             output_dir=self._config.recorder.output_dir,
             fps=self._config.recorder.fps,
             codec=self._config.recorder.codec,
-            frame_queue_url=Pipeline.FRAME_QUEUE_URL,
+            frame_queue_url=self._frame_queue_url,
+            worker_pool=self._worker_pool,
         )
 
     def _init_ws_client(self) -> None:
+        """Start the Feishu WebSocket command listener (idempotent).
+
+        The lark-oapi SDK's ``ws.Client`` owns a private asyncio event
+        loop with no public stop API, so we only ever create ONE instance
+        per process. Subsequent calls are a no-op.
+        """
+        if self._ws_client is not None:
+            # Already started (or start in progress) — don't restart.
+            return
         try:
             self._ws_client = FeishuWSClient(
                 config=self._config.notifier,
@@ -391,40 +978,40 @@ class GatewayController:
                 self._notification_service.disable_notification()
             if isinstance(self._notifier, FeishuNotifierAdapter):
                 self._notifier.send_text("[LarkSnap] 通知已关闭，发送 /start 可重新开启")
-        elif cmd.name == "pause":
-            if self._detection_running and not self._detection_paused:
-                self.pause()
-        elif cmd.name == "resume":
-            if self._detection_running and self._detection_paused:
-                self.resume()
         elif cmd.name == "status":
-            status = "running" if self._detection_running else "stopped"
-            if self._detection_running and self._detection_paused:
-                status = "paused"
-            notif = "enabled" if (self._notification_service and self._notification_service.notification_enabled) else "disabled"
+            s = self._get_state()
+            if s == GatewayState.DETECTING:
+                status = "running"
+            else:
+                status = s.value
+            notif = (
+                "enabled" if (self._notification_service
+                              and self._notification_service.notification_enabled)
+                else "disabled"
+            )
             self._logger.info("Gateway status: %s, notification: %s", status, notif)
         elif cmd.name == "help":
             self._logger.info(
-                "Available commands: /init, /start, /stop, /pause, /resume, /status, /help"
+                "Available commands: /init, /start, /stop, /status, /help"
             )
 
     def _release_adapters(self) -> None:
-        """Release all adapter resources."""
+        """Release all adapter resources (best-effort, never raises).
+
+        Uses ``_safe_release_adapter`` so a single adapter's failure
+        can't stop the rest from being cleaned up. This is the
+        production-grade guarantee: the gateway MUST end up with
+        ``None`` references and the IDLE state, no matter what.
+        """
         if self._pipeline is not None:
             try:
                 self._pipeline.stop()
-            except Exception:
-                pass
+            except Exception as e:
+                self._logger.error("Pipeline stop during release failed: %s", e)
             self._pipeline = None
 
-        adapters = [self._notifier, self._detector, self._camera, self._recorder]
-        for adapter in adapters:
-            if adapter is not None:
-                try:
-                    adapter.stop()
-                    adapter.release()
-                except Exception as e:
-                    self._logger.error("Error releasing adapter: %s", e)
+        for adapter in (self._notifier, self._detector, self._camera, self._recorder):
+            _safe_release_adapter(adapter, self._logger)
 
         self._notifier = None
         self._detector = None

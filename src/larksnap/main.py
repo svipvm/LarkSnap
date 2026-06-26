@@ -41,9 +41,24 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def run_with_qt(config_path: str | None) -> None:
-    """Run the application with PySide6 GUI."""
-    import atexit
+    """Run the application with PySide6 GUI.
 
+    Startup order is tuned for an "instant launch" feel:
+
+    1. Load config + set up logger
+    2. Create ``QApplication`` and ``MainWindow`` (cheap, <50 ms)
+    3. ``window.show()`` — user sees the UI immediately with a
+       "正在初始化摄像头" overlay
+    4. Camera initialization runs on a background daemon thread
+       (probing 3 frames + MSMF/DSHOW/ANY backend fallback can take
+       1–4 s on Windows; this would otherwise block the event loop)
+    5. When the camera is ready the pipeline publishes ``CAMERA_OPENED``;
+       the main window hides the loading overlay and starts the preview
+    """
+    import atexit
+    import threading
+
+    from PySide6.QtCore import QTimer
     from PySide6.QtWidgets import QApplication
 
     from larksnap.ui.main_window import MainWindow
@@ -60,6 +75,12 @@ def run_with_qt(config_path: str | None) -> None:
 
     logger.info("Starting LarkSnap (Qt GUI mode)...")
 
+    # Suppress noisy OpenCV/MSMF error logs (they will be translated to
+    # user-friendly messages in the camera adapter)
+    import logging as _logging
+    for _name in ("cv2", "opencv"):
+        _logging.getLogger(_name).setLevel(_logging.ERROR)
+
     app = QApplication(sys.argv)
     app.setApplicationName("LarkSnap")
     app.setQuitOnLastWindowClosed(True)
@@ -70,18 +91,25 @@ def run_with_qt(config_path: str | None) -> None:
     atexit.register(controller.stop)
 
     window = MainWindow(controller, config, config_path=config_path)
+    window.show()  # ← UI is up immediately, loading overlay shown
 
-    # Auto-initialize: open camera + start detection
-    try:
-        controller.initialize()
-        window.start_preview()
-        logger.info("LarkSnap started successfully")
-    except Exception as e:
-        logger.error("Failed to auto-start: %s", e)
-        # Camera failure is handled by event bus → QMessageBox
-        # Other errors: just show the window in stopped state
+    # Kick off camera initialization in the background so the event
+    # loop stays responsive. ``_async_init_camera`` will publish a
+    # ``CAMERA_OPENED`` (or ``CAMERA_FAILED``) event that the main
+    # window is already listening for.
+    def _async_init_camera() -> None:
+        try:
+            controller.initialize()
+            # start_preview must be called on the Qt main thread
+            QTimer.singleShot(0, window.start_preview)
+        except Exception as e:
+            logger.error("Background camera init failed: %s", e)
+            # CAMERA_FAILED event was already published by the
+            # controller; the main window will show the error dialog.
 
-    window.show()
+    init_thread = threading.Thread(target=_async_init_camera, daemon=True)
+    init_thread.start()
+    logger.info("LarkSnap UI shown; camera init running in background")
 
     exit_code = app.exec()
 

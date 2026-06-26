@@ -1,4 +1,22 @@
+"""Thread-safe event bus for inter-module communication.
+
+Publishers and subscribers can run on different threads. Handlers
+are invoked synchronously on the publisher's thread, so a handler
+that does slow work (HTTP, disk I/O) will block the publisher.
+Callers needing non-blocking dispatch should offload the slow work
+to a ``WorkerPool`` themselves.
+
+Concurrency contract:
+  - subscribe / unsubscribe / clear / publish are all safe to call
+    from any thread, including concurrently.
+  - Handlers are invoked on the publisher's thread, holding NO lock
+    for the duration of the call. This avoids the deadlock that
+    would arise if a handler tried to subscribe/unsubscribe from
+    inside its own callback.
+"""
+
 import logging
+import threading
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -19,13 +37,15 @@ class EventType(str, Enum):
     CAMERA_CLOSED = "camera_closed"
     DETECTION_STARTED = "detection_started"
     DETECTION_STOPPED = "detection_stopped"
-    DETECTION_PAUSED = "detection_paused"
-    DETECTION_RESUMED = "detection_resumed"
     SYSTEM_STARTED = "system_started"
     SYSTEM_STOPPED = "system_stopped"
     CHAT_ID_OBTAINED = "chat_id_obtained"
     NOTIFICATION_ENABLED = "notification_enabled"
     NOTIFICATION_DISABLED = "notification_disabled"
+    # Per-subsystem state change (Camera/Detector/Notifier). ``data``
+    # carries a ``ComponentStatus`` instance from
+    # ``larksnap.gateway.component_state``.
+    COMPONENT_STATE_CHANGED = "component_state_changed"
 
 
 @dataclass
@@ -37,30 +57,51 @@ class Event:
     source: str | None = None
 
 
-EventHandler = Callable[[Event], None]
+EventHandler = Callable[["Event"], None]
 
 
 class EventBus:
-    """Event bus for publish/subscribe inter-module communication."""
+    """Thread-safe event bus for publish/subscribe inter-module communication."""
 
     def __init__(self) -> None:
         self._handlers: dict[EventType, list[EventHandler]] = defaultdict(list)
+        # RLock (re-entrant) so a handler that calls subscribe/unsubscribe
+        # on the same bus from inside its own callback doesn't deadlock.
+        self._lock = threading.RLock()
         self._logger = logging.getLogger("larksnap.event_bus")
 
     def subscribe(self, event_type: EventType, handler: EventHandler) -> None:
         """Subscribe a handler to an event type."""
-        self._handlers[event_type].append(handler)
+        with self._lock:
+            self._handlers[event_type].append(handler)
 
     def unsubscribe(self, event_type: EventType, handler: EventHandler) -> None:
         """Unsubscribe a handler from an event type."""
-        if event_type in self._handlers:
-            self._handlers[event_type] = [
-                h for h in self._handlers[event_type] if h != handler
-            ]
+        with self._lock:
+            handlers = self._handlers.get(event_type)
+            if not handlers:
+                return
+            try:
+                handlers.remove(handler)
+            except ValueError:
+                # Idempotent: unsubscribing an unknown handler is a no-op.
+                pass
 
     def publish(self, event: Event) -> None:
-        """Publish an event to all subscribed handlers."""
-        handlers = self._handlers.get(event.type, [])
+        """Publish an event to all subscribed handlers.
+
+        Handlers are invoked on the publisher's thread. To avoid
+        deadlocks, the lock is released before any handler runs.
+        Exceptions in handlers are logged and swallowed so one bad
+        handler can't stop the rest from running.
+        """
+        # Snapshot the handler list under the lock, then release the
+        # lock before invoking them. This prevents a slow handler
+        # from blocking subscribe/unsubscribe on other threads, and
+        # also prevents a handler that calls subscribe/unsubscribe
+        # from deadlocking.
+        with self._lock:
+            handlers = list(self._handlers.get(event.type, ()))
         for handler in handlers:
             try:
                 handler(event)
@@ -71,4 +112,10 @@ class EventBus:
 
     def clear(self) -> None:
         """Remove all event subscriptions."""
-        self._handlers.clear()
+        with self._lock:
+            self._handlers.clear()
+
+    def handler_count(self, event_type: EventType) -> int:
+        """Return the number of handlers subscribed to an event type (for tests)."""
+        with self._lock:
+            return len(self._handlers.get(event_type, ()))

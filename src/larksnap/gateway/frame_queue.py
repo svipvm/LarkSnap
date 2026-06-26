@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
 import struct
 import threading
 import time
@@ -55,18 +56,30 @@ class FramePacket:
 
     @classmethod
     def from_zmq_frames(cls, metadata_bytes: bytes, frame_data: bytes) -> FramePacket:
-        """Deserialize from ZMQ multi-frame message."""
+        """Deserialize from ZMQ multi-frame message.
+
+        The deserialized frame is forced to be C-contiguous so that
+        downstream OpenCV calls won't trip the _step >= minstep assertion.
+        """
         metadata = json.loads(metadata_bytes.decode("utf-8"))
-        frame = np.frombuffer(frame_data, dtype=np.dtype(metadata["dtype"])).reshape(
-            metadata["height"], metadata["width"], metadata["channels"]
-        )
+        h, w, c = int(metadata["height"]), int(metadata["width"]), int(metadata["channels"])
+        dtype = np.dtype(metadata["dtype"])
+        expected_bytes = h * w * c * dtype.itemsize
+        if len(frame_data) < expected_bytes:
+            raise ValueError(
+                f"Frame data truncated: got {len(frame_data)} bytes, "
+                f"expected {expected_bytes} for shape ({h},{w},{c}) {dtype}"
+            )
+        frame = np.frombuffer(frame_data, dtype=dtype).reshape(h, w, c)
+        if not frame.flags.c_contiguous:
+            frame = np.ascontiguousarray(frame)
         return cls(
             frame=frame,
             timestamp=metadata["timestamp"],
             frame_index=metadata["frame_index"],
-            width=metadata["width"],
-            height=metadata["height"],
-            channels=metadata["channels"],
+            width=w,
+            height=h,
+            channels=c,
         )
 
 
@@ -107,7 +120,8 @@ class FrameProducer:
         self._fps_frame_count: int = 0
         self._consecutive_failures: int = 0
         self._current_backoff_ms: int = self.INITIAL_BACKOFF_MS
-        self._on_fatal_error = None
+        self._fatal_error_queue: queue.Queue[str] | None = None
+        self._last_friendly_error: str = ""
 
     @property
     def is_running(self) -> bool:
@@ -121,12 +135,17 @@ class FrameProducer:
     def consecutive_failures(self) -> int:
         return self._consecutive_failures
 
-    def set_on_fatal_error(self, callback) -> None:
-        """Set callback for when producer stops due to fatal camera errors.
+    def set_fatal_error_queue(self, error_queue: "queue.Queue[str]") -> None:
+        """Set a queue to receive fatal camera error messages.
 
-        callback(error_message: str)
+        Replacing the previous callback+thread-spawn design with a
+        queue keeps the producer thread bounded and predictable: the
+        worker thread can do a non-blocking ``put_nowait`` rather
+        than spawning an orphan thread, and the receiver can drain
+        the queue on its own dedicated thread (e.g. the pipeline's
+        fatal-error drain).
         """
-        self._on_fatal_error = callback
+        self._fatal_error_queue = error_queue
 
     def start(self, context: zmq.Context | None = None) -> None:
         """Start the frame producer thread."""
@@ -149,21 +168,42 @@ class FrameProducer:
         self._logger.info("Frame producer started on %s", self._zmq_url)
 
     def stop(self) -> None:
-        """Stop the frame producer."""
+        """Stop the frame producer.
+
+        Bounded close: the worker thread is given at most 2.0s to
+        exit before we move on. This guarantees the controller's
+        close path never blocks indefinitely on a stuck camera read.
+        """
         self._running = False
         # Close socket first to unblock any pending ZMQ operations
         if self._socket is not None:
-            self._socket.close(linger=0)
+            try:
+                self._socket.close(linger=0)
+            except Exception as e:  # noqa: BLE001
+                self._logger.error("Producer socket close failed: %s", e)
             self._socket = None
         if self._thread is not None:
-            self._thread.join(timeout=5.0)
+            self._thread.join(timeout=2.0)
+            if self._thread.is_alive():
+                self._logger.warning(
+                    "Producer thread did not exit within 2.0s; abandoning"
+                )
             self._thread = None
         self._logger.info("Frame producer stopped")
 
     def _run_loop(self) -> None:
         while self._running:
+            # Fast exit if the socket was torn down by stop()
+            if self._socket is None:
+                break
             try:
                 frame = self._camera.read_frame()
+
+                # Re-check after read_frame(): stop() may have run while we
+                # were blocked on the camera read, leaving the socket gone.
+                if not self._running or self._socket is None:
+                    break
+
                 packet = FramePacket(
                     frame=frame,
                     timestamp=time.time(),
@@ -204,27 +244,53 @@ class FrameProducer:
                 self._consecutive_failures = 0
                 self._current_backoff_ms = self.INITIAL_BACKOFF_MS
 
+            except AttributeError as e:
+                # 'NoneType' object has no attribute 'send_multipart' /
+                # 'shape' — happens when stop() tore down the socket or
+                # the camera between read_frame() and packet construction.
+                # Treat as a clean shutdown, not a camera failure.
+                if not self._running or self._socket is None:
+                    break
+                self._logger.debug("AttributeError during producer loop: %s", e)
+                time.sleep(0.1)
             except Exception as e:
+                # Translate raw OpenCV/MSMF errors to user-friendly messages
+                try:
+                    from larksnap.utils.camera_error_translator import (
+                        translate_camera_error,
+                    )
+                    friendly_msg = translate_camera_error(str(e))
+                except Exception:
+                    friendly_msg = str(e)
+
                 self._consecutive_failures += 1
+                # Stash the friendly message for the fatal error callback
+                self._last_friendly_error = friendly_msg
 
                 if self._consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES:
                     self._logger.error(
                         "Camera read failed %d consecutive times, stopping producer: %s",
-                        self._consecutive_failures, e,
+                        self._consecutive_failures, friendly_msg,
                     )
                     self._running = False
-                    # Schedule fatal error callback on a separate thread to
-                    # avoid deadlock (calling Pipeline.stop() from within the
-                    # producer thread would try to join itself).
-                    if self._on_fatal_error is not None:
-                        threading.Thread(
-                            target=self._on_fatal_error,
-                            args=(str(e),),
-                            daemon=True,
-                        ).start()
+                    # Hand the error to a queue instead of spawning
+                    # a thread. The receiver (pipeline) drains the
+                    # queue on its own thread, so the producer never
+                    # has to manage thread lifecycle of an orphan.
+                    # put_nowait is non-blocking and bounded; if the
+                    # receiver is wedged, we drop the message and
+                    # log it, which is the safe degradation.
+                    if self._fatal_error_queue is not None:
+                        try:
+                            self._fatal_error_queue.put_nowait(friendly_msg)
+                        except queue.Full:
+                            self._logger.error(
+                                "Fatal error queue is full; dropping message: %s",
+                                friendly_msg,
+                            )
                     break
 
-                # Log with appropriate frequency (every 1st, 5th, 10th, 20th, etc.)
+                # Log with appropriate frequency
                 log_interval = 1
                 if self._consecutive_failures > 10:
                     log_interval = 10
@@ -236,7 +302,7 @@ class FrameProducer:
                         "Camera read failure %d/%d: %s (backoff: %.1fs)",
                         self._consecutive_failures,
                         self.MAX_CONSECUTIVE_FAILURES,
-                        e,
+                        friendly_msg,
                         self._current_backoff_ms / 1000.0,
                     )
 
@@ -306,14 +372,24 @@ class FrameConsumer:
         self._logger.info("Frame consumer started on %s", self._zmq_url)
 
     def stop(self) -> None:
-        """Stop the frame consumer."""
+        """Stop the frame consumer (bounded).
+
+        Like ``FrameProducer.stop``: socket close is best-effort and
+        the worker thread is given 2.0s to exit.
+        """
         self._running = False
-        # Close socket first to unblock any pending ZMQ operations
         if self._socket is not None:
-            self._socket.close(linger=0)
+            try:
+                self._socket.close(linger=0)
+            except Exception as e:  # noqa: BLE001
+                self._logger.error("Consumer socket close failed: %s", e)
             self._socket = None
         if self._thread is not None:
-            self._thread.join(timeout=5.0)
+            self._thread.join(timeout=2.0)
+            if self._thread.is_alive():
+                self._logger.warning(
+                    "Consumer thread did not exit within 2.0s; abandoning"
+                )
             self._thread = None
         self._logger.info("Frame consumer stopped")
 
@@ -326,19 +402,33 @@ class FrameConsumer:
                 if not self._socket.poll(timeout=1000):
                     continue
 
+                # Re-check after poll: stop() may have torn down the socket
+                if not self._running or self._socket is None:
+                    break
+
                 frames = self._socket.recv_multipart()
                 if len(frames) != 2:
                     self._logger.warning("Invalid frame message, expected 2 parts")
                     continue
 
                 packet = FramePacket.from_zmq_frames(frames[0], frames[1])
+                if not self._running:
+                    break
                 if self._on_frame is not None:
                     self._on_frame(packet)
 
             except zmq.ZMQError as e:
-                if self._running:
-                    self._logger.error("Frame consumer ZMQ error: %s", e)
+                if not self._running or self._socket is None:
+                    break
+                self._logger.error("Frame consumer ZMQ error: %s", e)
+            except AttributeError as e:
+                # Socket torn down by stop() between iterations
+                if not self._running or self._socket is None:
+                    break
+                self._logger.debug("AttributeError in consumer loop: %s", e)
             except Exception as e:
+                if not self._running or self._socket is None:
+                    break
                 self._logger.error("Frame consumer error: %s", e)
 
 
@@ -425,12 +515,18 @@ class ResultSubscriber:
 
     def stop(self) -> None:
         self._running = False
-        # Close socket first to unblock any pending ZMQ operations
         if self._socket is not None:
-            self._socket.close(linger=0)
+            try:
+                self._socket.close(linger=0)
+            except Exception as e:  # noqa: BLE001
+                self._logger.error("Result subscriber socket close failed: %s", e)
             self._socket = None
         if self._thread is not None:
-            self._thread.join(timeout=5.0)
+            self._thread.join(timeout=2.0)
+            if self._thread.is_alive():
+                self._logger.warning(
+                    "Result subscriber thread did not exit within 2.0s; abandoning"
+                )
             self._thread = None
         self._logger.info("Result subscriber stopped")
 
@@ -443,17 +539,28 @@ class ResultSubscriber:
                 if not self._socket.poll(timeout=1000):
                     continue
 
+                if not self._running or self._socket is None:
+                    break
+
                 frames = self._socket.recv_multipart()
                 if len(frames) != 2:
                     continue
 
+                if not self._running:
+                    break
                 topic = frames[0].decode("utf-8")
                 data = json.loads(frames[1].decode("utf-8"))
                 if self._on_result is not None:
                     self._on_result(topic, data)
 
             except zmq.ZMQError as e:
-                if self._running:
-                    self._logger.error("Result subscriber ZMQ error: %s", e)
+                if not self._running or self._socket is None:
+                    break
+                self._logger.error("Result subscriber ZMQ error: %s", e)
+            except AttributeError:
+                if not self._running or self._socket is None:
+                    break
             except Exception as e:
+                if not self._running or self._socket is None:
+                    break
                 self._logger.error("Result subscriber error: %s", e)

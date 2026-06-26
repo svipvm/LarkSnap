@@ -37,25 +37,12 @@ class SystemTray:
 
     def _get_menu(self) -> tuple:
         status_text = "Running" if self._controller.is_running else "Stopped"
-        pause_text = "Pause" if not self._controller.is_paused else "Resume"
 
         return (
             pystray.MenuItem(f"Status: {status_text}", None, enabled=False),
-            pystray.MenuItem(
-                pause_text,
-                self._on_pause_resume,
-                enabled=self._controller.is_running,
-            ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", self._on_quit_action),
         )
-
-    def _on_pause_resume(self, icon: "pystray.Icon", item: "pystray.MenuItem") -> None:
-        if self._controller.is_paused:
-            self._controller.resume()
-        else:
-            self._controller.pause()
-        icon.menu = self._get_menu()
 
     def _on_quit_action(self, icon: "pystray.Icon", item: "pystray.MenuItem") -> None:
         self._controller.stop()

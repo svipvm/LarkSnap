@@ -1,7 +1,20 @@
-"""Feishu notifier adapter using app API for image and text messages."""
+"""Feishu notifier adapter using app API for image and text messages.
+
+Concurrency:
+  - ``set_chat_id`` and ``_persist_chat_id`` are protected by a
+    write lock so a UI-thread save can't race with a WS-client
+    thread save (which used to be able to corrupt the YAML file).
+  - The tenant access token cache is guarded by its own lock so
+    concurrent notification dispatches on the worker pool don't
+    each fire a token refresh and stampede the Feishu auth API.
+  - The httpx client is shared across threads; httpx is documented
+    as thread-safe for the ``Client`` class, so no extra lock is
+    needed around ``self._client.post``.
+"""
 
 import hashlib
 import logging
+import threading
 import time
 from pathlib import Path
 
@@ -25,6 +38,15 @@ class FeishuNotifierAdapter(NotifierAdapter):
         self._client: httpx.Client | None = None
         self._tenant_token: str | None = None
         self._token_expires: float = 0.0
+        # Serialise token refreshes so multiple workers don't all
+        # hit the auth endpoint at once. RLock (not Lock) so a
+        # caller that already holds the lock can re-enter.
+        self._token_lock = threading.RLock()
+        # Serialise config writes. The UI thread (settings dialog)
+        # and the WS client thread (chat_id learned from /init) can
+        # both invoke ``set_chat_id`` simultaneously; without this
+        # lock, two YAML writes can interleave and corrupt the file.
+        self._config_lock = threading.Lock()
 
     def connect(self) -> None:
         """Initialize the HTTP client for Feishu API."""
@@ -66,8 +88,20 @@ class FeishuNotifierAdapter(NotifierAdapter):
             self._logger.debug("Auto-detect chat_id failed: %s", e)
 
     def set_chat_id(self, chat_id: str) -> None:
-        """Update the target chat ID for notifications and persist to config."""
-        if chat_id and chat_id != self._config.chat_id:
+        """Update the target chat ID for notifications and persist to config.
+
+        Holds ``_config_lock`` for the whole read-modify-write of
+        the config file. The lock prevents a second ``set_chat_id``
+        call (e.g. from the WS client thread receiving a fresh
+        ``/init``) from racing the YAML read+modify+write here and
+        producing a corrupted file with the keys out of order or
+        the chat_id set to a stale value.
+        """
+        if not chat_id:
+            return
+        with self._config_lock:
+            if chat_id == self._config.chat_id:
+                return
             self._config.chat_id = chat_id
             self._logger.info("Notification target chat updated: %s", chat_id)
             self._persist_chat_id(chat_id)
@@ -147,34 +181,44 @@ class FeishuNotifierAdapter(NotifierAdapter):
             self._logger.info("Feishu notifier disconnected")
 
     def _get_tenant_token(self) -> str:
-        """Get or refresh the tenant_access_token."""
-        if (
-            self._tenant_token
-            and time.time() < self._token_expires
-        ):
-            return self._tenant_token
+        """Get or refresh the tenant_access_token.
 
-        if self._client is None:
-            raise NotifierError("Feishu notifier not connected")
+        Held under ``_token_lock`` so concurrent notification
+        dispatches on the worker pool don't all fire the same
+        auth request at once (the Feishu auth endpoint rate-limits
+        and will return 99991663 if you hammer it). The lock is
+        RLock so an outer caller that's already inside the critical
+        section (e.g. while holding it to chain token-aware calls)
+        can re-enter without deadlocking.
+        """
+        with self._token_lock:
+            if (
+                self._tenant_token
+                and time.time() < self._token_expires
+            ):
+                return self._tenant_token
 
-        resp = self._client.post(
-            f"{_FEISHU_BASE_URL}/auth/v3/tenant_access_token/internal",
-            json={
-                "app_id": self._config.app_id,
-                "app_secret": self._config.app_secret,
-            },
-        )
-        data = resp.json()
-        if data.get("code") != 0:
-            raise NotifierError(
-                f"Failed to get tenant token: {data.get('msg', 'unknown')}"
+            if self._client is None:
+                raise NotifierError("Feishu notifier not connected")
+
+            resp = self._client.post(
+                f"{_FEISHU_BASE_URL}/auth/v3/tenant_access_token/internal",
+                json={
+                    "app_id": self._config.app_id,
+                    "app_secret": self._config.app_secret,
+                },
             )
+            data = resp.json()
+            if data.get("code") != 0:
+                raise NotifierError(
+                    f"Failed to get tenant token: {data.get('msg', 'unknown')}"
+                )
 
-        self._tenant_token = data["tenant_access_token"]
-        expire = data.get("expire", 7200)
-        self._token_expires = time.time() + expire - 300  # refresh 5 min early
-        self._logger.info("Feishu tenant token refreshed")
-        return self._tenant_token
+            self._tenant_token = data["tenant_access_token"]
+            expire = data.get("expire", 7200)
+            self._token_expires = time.time() + expire - 300  # refresh 5 min early
+            self._logger.info("Feishu tenant token refreshed")
+            return self._tenant_token
 
     def _upload_image(self, image_path: str) -> str:
         """Upload an image to Feishu and return the image_key."""

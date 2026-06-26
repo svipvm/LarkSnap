@@ -12,6 +12,7 @@ import cv2
 import numpy as np
 from PySide6.QtCore import (
     QEasingCurve,
+    QObject,
     QPropertyAnimation,
     QRect,
     QSize,
@@ -57,6 +58,12 @@ from PySide6.QtWidgets import (
 from larksnap.adapters.detector.interface import DetectionResult
 from larksnap.config.loader import save_config
 from larksnap.config.models import AppConfig
+from larksnap.gateway.component_state import (
+    ComponentKind,
+    ComponentState,
+    ComponentStatus,
+    SystemStatus,
+)
 from larksnap.gateway.controller import GatewayController
 from larksnap.gateway.event_bus import Event, EventType
 
@@ -219,14 +226,65 @@ QScrollBar::handle:vertical:hover {
 """
 
 
+# ─── UI Event Bridge (cross-thread safe) ──────────────────────────────
+
+class UIEventBridge(QObject):
+    """Cross-thread bridge between ``EventBus`` and the main window.
+
+    The ``EventBus`` is synchronous: when ``publish()`` is called from
+    any thread, the subscribed handlers run on that *same* thread. If a
+    handler is a ``QWidget`` method (e.g. ``MainWindow._on_camera_opened``),
+    this violates Qt's thread affinity rules and the UI never updates
+    (silently fails or crashes on some platforms).
+
+    This bridge exposes one ``Signal`` per event type. The event bus
+    handler calls ``bridge.signal.emit(event)``, which is thread-safe
+    and the default connection type is ``QueuedConnection`` — the
+    receiving slot runs on the bridge's owning thread (the main thread,
+    because the bridge is created in ``MainWindow.__init__``).
+
+    Reference: https://doc.qt.io/qt-6/threads-qobject.html#signals-and-slots-across-threads
+    """
+
+    camera_opened = Signal(object)
+    camera_closed = Signal(object)
+    camera_opening = Signal(object)
+    camera_failed = Signal(object)
+    camera_read_failed = Signal(object)
+    chat_id_obtained = Signal(object)
+    notification_enabled = Signal(object)
+    notification_disabled = Signal(object)
+    # Per-subsystem state change (Camera/Detector/Notifier). Carries
+    # an ``Event`` whose ``data`` is a ``ComponentStatus``. Wired to
+    # ``MainWindow._on_component_state_changed`` so the status panel
+    # and menu checkboxes always reflect the backend in real time.
+    component_state_changed = Signal(object)
+
+
 # ─── Init Overlay (shown when chat_id not obtained) ───────────────────
 
 class InitOverlayWidget(QWidget):
-    """Semi-transparent overlay with spinning indicator and init prompt."""
+    """Semi-transparent overlay with spinning indicator and status prompt.
+
+    States:
+      - ``waiting``: "send /init in Feishu" (legacy behaviour, default)
+      - ``loading_camera``: "正在初始化摄像头..." (used during async
+        background camera initialisation so the UI can appear instantly
+        without waiting for the camera to come up)
+      - ``closing_camera``: "正在关闭摄像头..." (shown when the user
+        closes the camera, while the non-blocking gateway teardown is
+        still in flight on a background thread)
+      - ``closed``: hidden
+    """
+
+    STATE_WAITING = "waiting"
+    STATE_LOADING_CAMERA = "loading_camera"
+    STATE_CLOSING_CAMERA = "closing_camera"
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._angle = 0
+        self._state = self.STATE_WAITING
         self._timer = QTimer(self)
         self._timer.setInterval(30)
         self._timer.timeout.connect(self._rotate)
@@ -236,6 +294,18 @@ class InitOverlayWidget(QWidget):
         self.show()
         self.raise_()
         self._timer.start()
+
+    def show_loading_camera(self) -> None:
+        """Show the 'initialising camera' state. Used during background init."""
+        self._state = self.STATE_LOADING_CAMERA
+        self.show_overlay()
+
+    def show_closing_camera(self) -> None:
+        """Show the 'closing camera' state. Used while the gateway teardown
+        is running in the background after the user clicks the close button.
+        """
+        self._state = self.STATE_CLOSING_CAMERA
+        self.show_overlay()
 
     def hide_overlay(self) -> None:
         self._timer.stop()
@@ -273,17 +343,24 @@ class InitOverlayWidget(QWidget):
 
         painter.restore()
 
-        # Prompt text
+        # State-dependent text
+        if self._state == self.STATE_LOADING_CAMERA:
+            main_text = "正在初始化摄像头…"
+            sub_text = "Initialising camera, please wait"
+        elif self._state == self.STATE_CLOSING_CAMERA:
+            main_text = "正在关闭摄像头…"
+            sub_text = "Closing camera, please wait"
+        else:
+            main_text = "请在聊天软件中发送 /init 命令进行初始化以获取 chat_id"
+            sub_text = "Waiting for initialization..."
+
         painter.setPen(QColor(44, 62, 80))
         painter.setFont(QFont("Segoe UI", 14))
-        text = "请在聊天软件中发送 /init 命令进行初始化以获取 chat_id"
         text_rect = QRect(0, cy + 50, self.width(), 40)
-        painter.drawText(text_rect, Qt.AlignCenter, text)
+        painter.drawText(text_rect, Qt.AlignCenter, main_text)
 
-        # Sub-text
         painter.setPen(QColor(107, 124, 147))
         painter.setFont(QFont("Segoe UI", 10))
-        sub_text = "Waiting for initialization..."
         sub_rect = QRect(0, cy + 90, self.width(), 30)
         painter.drawText(sub_rect, Qt.AlignCenter, sub_text)
 
@@ -310,12 +387,14 @@ class VideoPreviewWidget(QWidget):
         self._detection_count: int = 0
         self._is_recording: bool = False
         self._is_running: bool = False
-        self._is_paused: bool = False
-        self._is_recording: bool = False
         self._rec_pulse_phase: float = 0.0
         self._show_hud: bool = True
         self._notification_enabled: bool = True
         self._camera_open: bool = False
+        # When True, paintEvent renders a solid black background instead
+        # of the gray "No Signal" placeholder. Set by clear_frame() after
+        # the camera has been closed so the live view area is pure black.
+        self._cleared: bool = False
 
         # HUD auto-hide timer
         self._hud_timer = QTimer(self)
@@ -379,18 +458,51 @@ class VideoPreviewWidget(QWidget):
         else:
             qimage = QImage(display.data, w, h, w, QImage.Format_Grayscale8)
         self._pixmap = QPixmap.fromImage(qimage)
+        # A new frame has arrived — we're no longer in the "cleared /
+        # pure black" post-close state.
+        self._cleared = False
         self.update()
 
-    def update_hud(self, fps: float, detection_count: int, running: bool, paused: bool, recording: bool, notification_enabled: bool = True, camera_open: bool = False) -> None:
+    def clear_frame(self) -> None:
+        """Reset the preview to a pure-black state with no cached frame.
+
+        Used after the camera is closed so the live view area no longer
+        displays the last captured frame. The widget will paint a solid
+        black background on the next ``paintEvent``.
+        """
+        self._pixmap = None
+        self._cleared = True
+        # The HUD reflects camera state; make sure it is also marked
+        # as closed so the floating overlay reads correctly until the
+        # init overlay takes over.
+        self._camera_open = False
+        self.update()
+
+    def update_hud(self, fps: float, detection_count: int, running: bool, recording: bool, notification_enabled: bool = True, camera_open: bool = False) -> None:
         self._fps = fps
         self._detection_count = detection_count
         self._is_running = running
-        self._is_paused = paused
         self._is_recording = recording
         self._notification_enabled = notification_enabled
         self._camera_open = camera_open
         if recording:
             self._rec_pulse_phase = (self._rec_pulse_phase + 0.1) % (2 * 3.14159)
+        self.update()
+
+    def update_component_state(self, status: ComponentStatus) -> None:
+        """Update HUD-level state derived from a ``ComponentStatus``.
+
+        The persistent top-left ``StatusPanel`` is the primary
+        surface for subsystem state. This method is kept for
+        backward compatibility with existing call sites, but no
+        longer draws any state text — it only flashes the REC-style
+        pulse for the recording indicator and forces a repaint.
+        """
+        # Show the HUD on every state change so the user gets
+        # immediate visual feedback even when they're not moving
+        # the mouse. ``show_hud_temporarily`` will hide it again
+        # after the standard timeout.
+        self.show_hud_temporarily()
         self.update()
 
     @classmethod
@@ -408,6 +520,10 @@ class VideoPreviewWidget(QWidget):
             x = (self.width() - scaled.width()) // 2
             y = (self.height() - scaled.height()) // 2
             painter.drawPixmap(x, y, scaled)
+        elif self._cleared:
+            # Camera was explicitly closed — render a pure black
+            # background so the last frame is not left lingering.
+            painter.fillRect(self.rect(), QColor(0, 0, 0))
         else:
             painter.fillRect(self.rect(), QColor("#e8ecf1"))
             painter.setPen(QColor("#8899aa"))
@@ -421,42 +537,16 @@ class VideoPreviewWidget(QWidget):
         painter.end()
 
     def _draw_hud(self, painter: QPainter) -> None:
-        """Draw semi-transparent HUD in corners — light tech style."""
+        """Draw semi-transparent HUD in the top-right corner only.
+
+        The camera / detector / notifier status is owned by the
+        persistent ``StatusPanel`` widget in the top-left, so the
+        HUD no longer duplicates that information here. Only the
+        recording indicator (which is transient and only visible
+        while recording) is drawn from the HUD, in the top-right
+        corner.
+        """
         w, h = self.width(), self.height()
-
-        # Top-left: status + FPS — frosted glass card
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor(255, 255, 255, 200))
-        painter.drawRoundedRect(12, 12, 200, 68, 10, 10)
-        # Subtle border
-        painter.setPen(QPen(QColor(208, 215, 226, 180), 1))
-        painter.setBrush(Qt.NoBrush)
-        painter.drawRoundedRect(12, 12, 200, 68, 10, 10)
-
-        painter.setFont(QFont("Segoe UI", 11))
-        if self._is_running:
-            status_text = "PAUSED" if self._is_paused else "DETECTING"
-            status_color = QColor("#e67e22") if self._is_paused else QColor("#27ae60")
-        elif self._camera_open:
-            status_text = "CAMERA ON"
-            status_color = QColor("#0078d4")
-        else:
-            status_text = "STOPPED"
-            status_color = QColor("#95a5a6")
-
-        painter.setPen(status_color)
-        painter.drawText(22, 34, f"● {status_text}")
-        painter.setPen(QColor(44, 62, 80))
-        painter.setFont(QFont("Segoe UI", 10))
-        painter.drawText(22, 52, f"FPS: {self._fps:.1f}")
-
-        # Notification status
-        if self._notification_enabled:
-            painter.setPen(QColor("#27ae60"))
-            painter.drawText(22, 70, "NOTIFY: ON")
-        else:
-            painter.setPen(QColor("#e74c3c"))
-            painter.drawText(22, 70, "NOTIFY: OFF")
 
         # Top-right: recording indicator — frosted glass card
         if self._is_recording:
@@ -481,6 +571,206 @@ class VideoPreviewWidget(QWidget):
         super().mouseMoveEvent(event)
 
 
+# ─── Status Panel (top-left, persistent) ─────────────────────────────
+
+class StatusPanel(QWidget):
+    """Persistent top-left panel showing each subsystem's current state.
+
+    Each subsystem (camera, detector, notifier) gets one row: a small
+    status dot in the subsystem's state colour, the subsystem's
+    English label, and the current state name from
+    ``ComponentState.display_name``. The whole card is always visible
+    (no auto-hide) so the user can monitor state at a glance.
+
+    A final row shows the live producer FPS so the diagnostics that
+    used to live in the (now removed) transient HUD card are
+    preserved on a single, always-visible surface.
+
+    Animations:
+      - On state change, the row briefly highlights with a colour
+        pulse driven by a ``QPropertyAnimation`` on the opacity of
+        the new state's colour. This gives the eye a "blink" cue
+        that something just changed, but settles to the steady
+        state within ~400ms.
+      - The status dot colour is animated smoothly to the new
+        colour over 250ms rather than snapping, which avoids the
+        "flash" effect that would happen on every transition.
+    """
+
+    PANEL_MARGIN = 16
+    ROW_HEIGHT = 22
+    PANEL_PADDING = 12
+
+    # Colour palette for each ComponentState. Single source of
+    # truth so the panel stays visually consistent across the app.
+    _STATE_COLORS: dict[str, str] = {
+        ComponentState.RUNNING.value: "#27ae60",
+        ComponentState.STARTING.value: "#0078d4",
+        ComponentState.STOPPING.value: "#0078d4",
+        ComponentState.FAILED.value: "#e74c3c",
+        ComponentState.DISABLED.value: "#7f8c8d",
+        ComponentState.STOPPED.value: "#95a5a6",
+        ComponentState.IDLE.value: "#95a5a6",
+    }
+
+    # English subsystem labels — kept here so the panel and any
+    # future log/CSV export stay in lock-step without having to
+    # touch multiple files.
+    _SUBSYSTEM_LABELS: dict[str, str] = {
+        ComponentKind.CAMERA.value: "Camera",
+        ComponentKind.DETECTOR.value: "Detector",
+        ComponentKind.NOTIFIER.value: "Notifier",
+    }
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        # Current and target dot colours per subsystem, used by the
+        # animation timer to interpolate. Keys are
+        # ``ComponentKind.value``.
+        self._current_colors: dict[str, QColor] = {
+            ComponentKind.CAMERA.value: QColor(self._STATE_COLORS[ComponentState.IDLE.value]),
+            ComponentKind.DETECTOR.value: QColor(self._STATE_COLORS[ComponentState.IDLE.value]),
+            ComponentKind.NOTIFIER.value: QColor(self._STATE_COLORS[ComponentState.DISABLED.value]),
+        }
+        self._target_colors: dict[str, QColor] = dict(self._current_colors)
+        self._current_labels: dict[str, str] = {
+            ComponentKind.CAMERA.value: ComponentState.IDLE.display_name,
+            ComponentKind.DETECTOR.value: ComponentState.IDLE.display_name,
+            ComponentKind.NOTIFIER.value: ComponentState.DISABLED.display_name,
+        }
+        # Live FPS value, refreshed by ``MainWindow._update_hud``.
+        self._fps: float = 0.0
+        self._anim_step: int = 0  # 0..10, 10 = at target
+        self._anim_active: bool = False
+
+        self._anim_timer = QTimer(self)
+        self._anim_timer.setInterval(25)  # ~250ms total
+        self._anim_timer.timeout.connect(self._tick_animation)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+
+    def update_fps(self, fps: float) -> None:
+        """Update the live FPS readout in the panel."""
+        if abs(self._fps - fps) < 0.05:
+            return
+        self._fps = fps
+        self.update()
+
+    def update_state(self, status: ComponentStatus) -> None:
+        """Apply a new ``ComponentStatus`` to the panel.
+
+        Triggers a smooth colour and label transition. The label
+        changes immediately; the colour is animated to the new
+        state over ~250ms.
+        """
+        kind_key = status.kind.value
+        new_label = status.display_name
+        new_color_hex = self._STATE_COLORS.get(
+            status.state.value, "#95a5a6",
+        )
+        new_color = QColor(new_color_hex)
+
+        if self._current_labels[kind_key] == new_label and \
+                self._target_colors[kind_key].name() == new_color.name():
+            return  # no change, skip animation
+
+        self._current_labels[kind_key] = new_label
+        self._target_colors[kind_key] = new_color
+        self._anim_step = 0
+        if not self._anim_active:
+            self._anim_active = True
+            self._anim_timer.start()
+        self.update()
+
+    def _tick_animation(self) -> None:
+        """Interpolate colours one step closer to their targets."""
+        self._anim_step += 1
+        done = True
+        for key in self._current_colors:
+            cur = self._current_colors[key]
+            tgt = self._target_colors[key]
+            if cur.red() != tgt.red() or cur.green() != tgt.green() or cur.blue() != tgt.blue():
+                t = self._anim_step / 10.0
+                nr = int(cur.red() + (tgt.red() - cur.red()) * t)
+                ng = int(cur.green() + (tgt.green() - cur.green()) * t)
+                nb = int(cur.blue() + (tgt.blue() - cur.blue()) * t)
+                self._current_colors[key] = QColor(nr, ng, nb)
+                done = False
+        if self._anim_step >= 10 or done:
+            # Snap to final colours and stop.
+            for key in self._current_colors:
+                self._current_colors[key] = QColor(self._target_colors[key])
+            self._anim_active = False
+            self._anim_timer.stop()
+        self.update()
+
+    def sizeHint(self) -> QSize:
+        return QSize(240, 132)
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        rows = [
+            (self._SUBSYSTEM_LABELS[ComponentKind.CAMERA.value], ComponentKind.CAMERA.value),
+            (self._SUBSYSTEM_LABELS[ComponentKind.DETECTOR.value], ComponentKind.DETECTOR.value),
+            (self._SUBSYSTEM_LABELS[ComponentKind.NOTIFIER.value], ComponentKind.NOTIFIER.value),
+        ]
+
+        w = 240
+        # 3 subsystem rows + 1 FPS row.
+        h = self.PANEL_PADDING * 2 + self.ROW_HEIGHT * (len(rows) + 1)
+        # Frosted glass background
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(255, 255, 255, 215))
+        painter.drawRoundedRect(0, 0, w, h, 10, 10)
+        # Subtle border
+        painter.setPen(QPen(QColor(208, 215, 226, 200), 1))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRoundedRect(0, 0, w, h, 10, 10)
+
+        font_lbl = QFont("Segoe UI", 10, QFont.DemiBold)
+        font_state = QFont("Segoe UI", 10)
+        y = self.PANEL_PADDING + 4
+
+        for label, kind_key in rows:
+            # Status dot (animated colour)
+            color = self._current_colors[kind_key]
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(color)
+            painter.drawEllipse(self.PANEL_PADDING, y - 6, 10, 10)
+
+            # Subsystem label (gray)
+            painter.setFont(font_lbl)
+            painter.setPen(QColor(74, 85, 104))
+            painter.drawText(
+                self.PANEL_PADDING + 20, y + 4, label,
+            )
+
+            # State name (animated colour)
+            painter.setFont(font_state)
+            painter.setPen(color)
+            state_text = self._current_labels[kind_key]
+            painter.drawText(
+                self.PANEL_PADDING + 90, y + 4, state_text,
+            )
+
+            y += self.ROW_HEIGHT
+
+        # ── FPS row ──
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(74, 85, 104))
+        painter.drawEllipse(self.PANEL_PADDING, y - 6, 10, 10)
+        painter.setFont(font_lbl)
+        painter.setPen(QColor(74, 85, 104))
+        painter.drawText(self.PANEL_PADDING + 20, y + 4, "FPS")
+        painter.setFont(font_state)
+        painter.setPen(QColor(44, 62, 80))
+        painter.drawText(self.PANEL_PADDING + 90, y + 4, f"{self._fps:.1f}")
+
+        painter.end()
+
+
 # ─── Control Dialog ───────────────────────────────────────────────────
 
 class ControlDialog(QDialog):
@@ -488,20 +778,18 @@ class ControlDialog(QDialog):
 
     start_requested = Signal()
     stop_requested = Signal()
-    pause_requested = Signal()
-    resume_requested = Signal()
     start_recording_requested = Signal()
     stop_recording_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Controls")
-        self.setFixedSize(280, 240)
+        # Height reduced to fit only Start/Stop + Record.
+        self.setFixedSize(280, 210)
         self.setStyleSheet(LIGHT_TECH_STYLE)
         self.setWindowFlags(Qt.Tool | Qt.WindowStaysOnTopHint)
 
         self._is_running = False
-        self._is_paused = False
         self._is_recording = False
 
         layout = QVBoxLayout(self)
@@ -527,17 +815,8 @@ class ControlDialog(QDialog):
         self._stop_btn.clicked.connect(self.stop_requested.emit)
         self._stop_btn.setEnabled(False)
 
-        self._pause_btn = QPushButton("Pause")
-        self._pause_btn.setStyleSheet(
-            "QPushButton{background:qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #fef5e4,stop:1 #fce4b8);border-color:#e67e22;color:#d35400}"
-            "QPushButton:hover{background:#e67e22;color:#fff}"
-        )
-        self._pause_btn.clicked.connect(self._on_pause)
-        self._pause_btn.setEnabled(False)
-
         det_layout.addWidget(self._start_btn)
         det_layout.addWidget(self._stop_btn)
-        det_layout.addWidget(self._pause_btn)
 
         # Recording
         rec_group = QGroupBox("Recording")
@@ -561,27 +840,14 @@ class ControlDialog(QDialog):
         self._is_running = running
         self._start_btn.setEnabled(not running)
         self._stop_btn.setEnabled(running)
-        self._pause_btn.setEnabled(running)
         self._record_btn.setEnabled(running)
         if not running:
-            self._is_paused = False
             self._is_recording = False
-            self._pause_btn.setText("Pause")
             self._record_btn.setText("Record")
-
-    def set_paused(self, paused: bool) -> None:
-        self._is_paused = paused
-        self._pause_btn.setText("Resume" if paused else "Pause")
 
     def set_recording(self, recording: bool) -> None:
         self._is_recording = recording
         self._record_btn.setText("Stop Rec" if recording else "Record")
-
-    def _on_pause(self) -> None:
-        if self._is_paused:
-            self.resume_requested.emit()
-        else:
-            self.pause_requested.emit()
 
     def _on_record_toggle(self) -> None:
         if self._is_recording:
@@ -949,8 +1215,29 @@ class MainWindow(QMainWindow):
         self._preview = VideoPreviewWidget()
         self.setCentralWidget(self._preview)
 
-        # Init overlay (shown when chat_id not obtained)
+        # Init overlay (shown when chat_id not obtained, or while
+        # background camera initialisation is in progress)
         self._init_overlay = InitOverlayWidget(self._preview)
+        # Show the "loading camera" overlay immediately so the user sees
+        # visual feedback the moment the window appears. It will be
+        # replaced by either the /init prompt or hidden once the camera
+        # is ready.
+        self._init_overlay.show_loading_camera()
+
+        # Persistent top-left status panel showing camera / detector /
+        # notifier state in unified ``ComponentState`` wording. Always
+        # visible (no auto-hide) so the user can monitor at a glance.
+        self._status_panel = StatusPanel(self._preview)
+        # Seed the panel with the controller's current state so it
+        # doesn't show "Idle" for subsystems that are already
+        # running at startup.
+        try:
+            system_status = self._controller.get_system_status()
+            self._status_panel.update_state(system_status.camera)
+            self._status_panel.update_state(system_status.detector)
+            self._status_panel.update_state(system_status.notifier)
+        except Exception:  # noqa: BLE001 — best-effort
+            pass
 
         # No status bar — HUD is overlaid on video
 
@@ -964,7 +1251,7 @@ class MainWindow(QMainWindow):
         self._tray_icon.activated.connect(self._on_tray_activated)
 
         tray_menu = QMenu()
-        tray_menu.addAction("Show", self._show_window)
+        tray_menu.addAction("Show Main Window", self._show_window)
         tray_menu.addSeparator()
         self._tray_open_cam_action = tray_menu.addAction("Open Camera")
         self._tray_open_cam_action.triggered.connect(self._on_open_camera)
@@ -975,12 +1262,17 @@ class MainWindow(QMainWindow):
         self._tray_start_det_action.triggered.connect(self._on_start_detection)
         self._tray_stop_det_action = tray_menu.addAction("Stop Detection")
         self._tray_stop_det_action.triggered.connect(self._on_stop_detection)
-        tray_menu.addAction("Pause / Resume", self._on_pause_resume)
         tray_menu.addSeparator()
-        tray_menu.addAction("Record", self._on_record_toggle)
+        tray_menu.addAction("Toggle Recording", self._on_record_toggle)
         tray_menu.addSeparator()
-        self._tray_notif_action = tray_menu.addAction("Notification: ON")
-        self._tray_notif_action.triggered.connect(self._on_tray_notification_toggle)
+        self._tray_enable_notif_action = tray_menu.addAction("Enable Notification")
+        self._tray_enable_notif_action.triggered.connect(
+            lambda: self._on_notification_toggle(True),
+        )
+        self._tray_disable_notif_action = tray_menu.addAction("Disable Notification")
+        self._tray_disable_notif_action.triggered.connect(
+            lambda: self._on_notification_toggle(False),
+        )
         tray_menu.addSeparator()
         tray_menu.addAction("Settings", self._show_settings)
         tray_menu.addSeparator()
@@ -990,12 +1282,36 @@ class MainWindow(QMainWindow):
 
         self._close_to_tray = True
 
-        # Subscribe to gateway events
-        self._controller.event_bus.subscribe(EventType.CAMERA_FAILED, self._on_camera_failed)
-        self._controller.event_bus.subscribe(EventType.CAMERA_READ_FAILED, self._on_camera_read_failed)
-        self._controller.event_bus.subscribe(EventType.CHAT_ID_OBTAINED, self._on_chat_id_obtained)
-        self._controller.event_bus.subscribe(EventType.NOTIFICATION_ENABLED, self._on_notification_enabled)
-        self._controller.event_bus.subscribe(EventType.NOTIFICATION_DISABLED, self._on_notification_disabled)
+        # Cross-thread UI event bridge. The event bus is synchronous, so
+        # handlers run on whatever thread publishes the event. Routing
+        # through Qt signals (default QueuedConnection) ensures UI
+        # handlers always execute on the main thread.
+        self._ui_bridge = UIEventBridge()
+        self._ui_bridge.camera_opened.connect(self._on_camera_opened)
+        self._ui_bridge.camera_closed.connect(self._on_camera_closed)
+        self._ui_bridge.camera_failed.connect(self._on_camera_failed)
+        self._ui_bridge.camera_read_failed.connect(self._on_camera_read_failed)
+        self._ui_bridge.chat_id_obtained.connect(self._on_chat_id_obtained)
+        self._ui_bridge.notification_enabled.connect(self._on_notification_enabled)
+        self._ui_bridge.notification_disabled.connect(self._on_notification_disabled)
+        # Unified per-subsystem state changes — drives the status
+        # panel, the HUD, and the menu enable-state sync.
+        self._ui_bridge.component_state_changed.connect(self._on_component_state_changed)
+
+        # Subscribe to gateway events (emit bridge signal as the handler).
+        # The emit call is thread-safe; the actual slot runs on the main
+        # thread via Qt's queued connection.
+        self._controller.event_bus.subscribe(EventType.CAMERA_OPENED, self._ui_bridge.camera_opened.emit)
+        self._controller.event_bus.subscribe(EventType.CAMERA_CLOSED, self._ui_bridge.camera_closed.emit)
+        self._controller.event_bus.subscribe(EventType.CAMERA_FAILED, self._ui_bridge.camera_failed.emit)
+        self._controller.event_bus.subscribe(EventType.CAMERA_READ_FAILED, self._ui_bridge.camera_read_failed.emit)
+        self._controller.event_bus.subscribe(EventType.CHAT_ID_OBTAINED, self._ui_bridge.chat_id_obtained.emit)
+        self._controller.event_bus.subscribe(EventType.NOTIFICATION_ENABLED, self._ui_bridge.notification_enabled.emit)
+        self._controller.event_bus.subscribe(EventType.NOTIFICATION_DISABLED, self._ui_bridge.notification_disabled.emit)
+        self._controller.event_bus.subscribe(
+            EventType.COMPONENT_STATE_CHANGED,
+            self._ui_bridge.component_state_changed.emit,
+        )
 
         # Timers
         self._preview_timer = QTimer(self)
@@ -1046,11 +1362,6 @@ class MainWindow(QMainWindow):
 
         det_menu.addSeparator()
 
-        self._pause_action = det_menu.addAction("Pause")
-        self._pause_action.setShortcut("Space")
-        self._pause_action.triggered.connect(self._on_pause_resume)
-        self._pause_action.setEnabled(False)
-
         # ── Recording menu ──
         rec_menu = menu_bar.addMenu("Recording")
 
@@ -1062,11 +1373,20 @@ class MainWindow(QMainWindow):
         # ── Notification menu ──
         notif_menu = menu_bar.addMenu("Notification")
 
-        self._notif_action = notif_menu.addAction("Notification: ON")
-        self._notif_action.setCheckable(True)
-        self._notif_action.setChecked(True)
-        self._notif_action.setShortcut("Ctrl+N")
-        self._notif_action.toggled.connect(self._on_notification_toggle)
+        # Two non-checkable actions so the menu mirrors the Camera
+        # menu (separate "Open Camera" / "Close Camera"). The current
+        # on/off state is reflected in the StatusPanel / HUD, not in
+        # the menu item itself.
+        self._enable_notif_action = notif_menu.addAction("Enable Notification")
+        self._enable_notif_action.setShortcut("Ctrl+N")
+        self._enable_notif_action.triggered.connect(
+            lambda: self._on_notification_toggle(True),
+        )
+
+        self._disable_notif_action = notif_menu.addAction("Disable Notification")
+        self._disable_notif_action.triggered.connect(
+            lambda: self._on_notification_toggle(False),
+        )
 
         # ── View menu ──
         view_menu = menu_bar.addMenu("View")
@@ -1112,45 +1432,95 @@ class MainWindow(QMainWindow):
             action.triggered.connect(lambda checked, i=idx: self._on_select_camera(i))
 
     def _on_select_camera(self, device_index: int) -> None:
-        """Switch to a different camera device."""
+        """Switch to a different camera device.
+
+        Camera close is non-blocking, so we wait for it to finish
+        (bounded) before opening the new device — otherwise the new
+        open would race the old close and one of them would be
+        rejected by the controller.
+        """
+        if self._controller.is_busy:
+            self._logger.info("Camera operation in progress; ignoring switch")
+            return
+
         if self._controller.is_camera_open:
-            # Close current, reopen with new device
             self._controller.close_camera()
+            # Bounded wait so the UI doesn't freeze if ZMQ teardown
+            # is slow. The pipeline's stop() is also bounded, so this
+            # returns quickly under normal conditions.
+            self._controller.wait_closed(timeout=5.0)
             self.stop_preview()
+            # Clear the cached frame so the live view area shows
+            # pure black during the device switch instead of the
+            # last frame from the previous camera.
+            self._preview.clear_frame()
+
+        self._init_overlay.show_loading_camera()
+        self._update_action_states()
         try:
             self._controller.open_camera(device_index)
-            self.start_preview()
         except Exception as e:
             from larksnap.utils.exceptions import CameraError, GatewayError
             if isinstance(e, (CameraError, GatewayError)):
                 # Camera error already handled by event bus
-                pass
+                self._init_overlay.hide_overlay()
             else:
                 raise
         self._refresh_camera_devices()
         self._update_action_states()
 
     def _on_open_camera(self) -> None:
-        """Open camera and start preview."""
+        """Open camera and start preview.
+
+        The gateway is now responsible for starting the pipeline
+        (preview) immediately on open. We just trigger the open and
+        show the loading overlay. ``_on_camera_opened`` will hide
+        the overlay and start the preview timer.
+        """
+        if self._controller.is_busy:
+            self._logger.info("Camera operation in progress; ignoring open request")
+            return
         if self._controller.is_camera_open:
             return
+
+        # Show the loading overlay BEFORE the (potentially slow) open
+        # call returns, so the user always has visual feedback.
+        self._init_overlay.show_loading_camera()
+        self._update_action_states()
+
         try:
             self._controller.open_camera()
-            self.start_preview()
-            # Show init overlay if chat_id not yet obtained
-            if not self._config.notifier.chat_id:
-                self._init_overlay.show_overlay()
         except Exception as e:
             from larksnap.utils.exceptions import CameraError, GatewayError
             if isinstance(e, (CameraError, GatewayError)):
+                # Camera error already handled by event bus
+                self._init_overlay.hide_overlay()
                 self._update_action_states()
                 return
             raise
         self._update_action_states()
 
     def _on_close_camera(self) -> None:
-        """Close camera and stop everything."""
-        self._controller.close_camera()
+        """Close camera and stop everything.
+
+        Camera close is now non-blocking on the gateway side, so the
+        UI thread is never frozen. We hide the preview immediately,
+        show a "closing" overlay, and let ``_on_camera_closed`` clean
+        up the rest when the background teardown finishes.
+        """
+        if self._controller.is_busy or not self._controller.is_camera_open:
+            self._update_action_states()
+            return
+
+        # Show the "closing" overlay so the user sees feedback even
+        # though the close happens in the background. This replaces
+        # the "initialising camera" loading text with a dedicated
+        # "closing camera" message for the close flow.
+        self._init_overlay.show_closing_camera()
+        # Eagerly clear the preview frame so the live view area
+        # switches to pure black immediately, not after the
+        # background teardown completes.
+        self._preview.clear_frame()
         self.stop_preview()
         self._update_action_states()
         if self._control_dialog:
@@ -1158,6 +1528,8 @@ class MainWindow(QMainWindow):
             self._control_dialog.set_recording(False)
         if self._stats_dialog:
             self._stats_dialog.update_stats(0, 0, False)
+
+        self._controller.close_camera()
 
     def _on_start_detection(self) -> None:
         """Start detection (camera must be open)."""
@@ -1175,57 +1547,150 @@ class MainWindow(QMainWindow):
 
     def _on_camera_failed(self, event: Event) -> None:
         """Handle camera failure event — show error dialog."""
-        data = event.data or {}
-        device_index = data.get("device_index", "?")
-        error_msg = data.get("error", "Unknown error")
-        self._update_action_states()
-        QMessageBox.critical(
-            self,
-            "Camera Error",
-            f"Failed to open camera (device {device_index}).\n\n"
-            f"Error: {error_msg}\n\n"
-            f"Please check that the camera is connected and not in use by another application.",
+        from larksnap.utils.camera_error_translator import (
+            get_solution_hint,
+            translate_camera_error,
         )
 
-    def _on_camera_read_failed(self, event: Event) -> None:
-        """Handle camera read failure after max retries — pipeline has stopped.
-
-        Uses QTimer.singleShot to marshal UI work back to the main thread,
-        since this handler may be called from a background thread.
-        """
         data = event.data or {}
-        error_msg = data.get("error", "Unknown error")
+        device_index = data.get("device_index", "?")
+        raw_error = data.get("error", "未知错误")
+        friendly = translate_camera_error(raw_error)
+        solution = get_solution_hint(raw_error)
 
-        # Schedule UI updates on the main thread
+        QMessageBox.critical(
+            self,
+            "摄像头错误",
+            f"无法打开摄像头（设备索引 {device_index}）。\n\n"
+            f"原因：{friendly}\n\n"
+            f"{solution}",
+        )
+        self._update_action_states()
+
+    def _on_camera_read_failed(self, event: Event) -> None:
+        """Handle camera read failure after max retries — pipeline has stopped."""
+        data = event.data or {}
+        error_msg = data.get("error", "未知错误")
         QTimer.singleShot(0, lambda: self._handle_camera_read_failed(error_msg))
 
     def _handle_camera_read_failed(self, error_msg: str) -> None:
         """Show camera read failure dialog on the main thread."""
+        from larksnap.utils.camera_error_translator import (
+            get_solution_hint,
+            translate_camera_error,
+        )
+
+        friendly = translate_camera_error(error_msg)
+        solution = get_solution_hint(error_msg)
+
         self._update_action_states()
         self.stop_preview()
-        QMessageBox.critical(
-            self,
-            "Camera Read Error",
-            f"Camera read failed repeatedly and the pipeline has been stopped.\n\n"
-            f"Error: {error_msg}\n\n"
-            f"The camera may be in use by another application. "
-            f"Please close other applications using the camera and try again.",
+
+        # Dialog with a "重试" option that reopens the camera
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Critical)
+        box.setWindowTitle("摄像头读取错误")
+        box.setText(
+            f"摄像头连续多次读取失败，检测已自动停止。\n\n"
+            f"原因：{friendly}\n\n"
+            f"{solution}\n\n"
+            f"是否立即重新打开摄像头？"
         )
+        retry_btn = box.addButton("重新打开摄像头", QMessageBox.AcceptRole)
+        box.addButton("稍后再试", QMessageBox.RejectRole)
+        box.exec_()
+
+        if box.clickedButton() is retry_btn:
+            self._on_open_camera()
 
     def _on_chat_id_obtained(self, event: Event) -> None:
         """Handle chat_id obtained — hide init overlay."""
         self._logger.info("Chat ID obtained, hiding init overlay")
         self._init_overlay.hide_overlay()
 
+    def _on_camera_opened(self, event: Event) -> None:
+        """Handle camera opened — hide the loading overlay and start preview.
+
+        Called via the event bus when the background camera initialisation
+        thread (started in ``main.py``) successfully opens the camera.
+        """
+        self._logger.info("Camera opened event received; hiding loading overlay")
+        self._init_overlay.hide_overlay()
+        self._update_action_states()
+        # Pipeline is now running with detection. Start the preview
+        # timer so the user sees frames.
+        if not self._preview_timer.isActive():
+            self.start_preview()
+        # If user has not obtained chat_id, show the init prompt
+        if not self._config.notifier.chat_id:
+            self._init_overlay.show_overlay()
+
+    def _on_camera_closed(self, event: Event) -> None:
+        """Handle camera closed — fired by the background close worker.
+
+        The close itself is non-blocking (returns immediately from
+        ``controller.close_camera()``), so this handler runs on the
+        main thread some time later when ZMQ teardown is complete.
+        """
+        self._logger.info("Camera closed event received; finalizing UI")
+        # Clear the preview so the live view area shows pure black
+        # instead of the last captured frame. The closing overlay
+        # covers this for most of the close window, but if the
+        # overlay was already hidden (e.g. a fast close path) the
+        # black background is what the user sees.
+        self._preview.clear_frame()
+        self._init_overlay.hide_overlay()
+        # Reset diagnostic flags so the next open can re-log first frame
+        self._first_frame_logged = False
+        self._no_frame_warned = False
+        self._update_action_states()
+
     def _on_notification_enabled(self, event: Event) -> None:
         """Handle notification enabled — sync UI."""
-        self._notif_action.setChecked(True)
         self._sync_notification_ui(True)
 
     def _on_notification_disabled(self, event: Event) -> None:
         """Handle notification disabled — sync UI."""
-        self._notif_action.setChecked(False)
         self._sync_notification_ui(False)
+
+    def _on_component_state_changed(self, event: Event) -> None:
+        """Handle a unified component state change from the gateway.
+
+        Updates the persistent status panel, the HUD, and the
+        menu/tray checkboxes for the affected subsystem so all
+        surfaces stay in lock-step with the backend.
+
+        ``event.data`` is a ``ComponentStatus`` instance (camera,
+        detector, or notifier).
+        """
+        status = event.data
+        if not isinstance(status, ComponentStatus):
+            return
+
+        # 1. Persistent top-left status panel — primary surface.
+        self._status_panel.update_state(status)
+
+        # 2. In-video HUD — secondary surface (transient, auto-hides).
+        self._preview.update_component_state(status)
+
+        # 3. Menu / tray enable-state sync.
+        if status.kind is ComponentKind.NOTIFIER:
+            enabled = status.state is not ComponentState.DISABLED
+            self._sync_notification_ui(enabled)
+
+        elif status.kind is ComponentKind.DETECTOR:
+            # Detector: menu enable state is driven here so that
+            # STARTING/RUNNING/STOPPING/FAILED/STOPPED transitions
+            # are all reflected in Start/Stop Detection.
+            self._update_action_states()
+
+        elif status.kind is ComponentKind.CAMERA:
+            # Camera: menu enable/disable is already driven by
+            # _update_action_states, called from the camera-opened/
+            # camera-closed/closing-camera handlers. Re-run it here
+            # so STARTING/STOPPING/FAILED/STOPPED transitions are
+            # reflected too (e.g. disable Open Camera while OPENING).
+            self._update_action_states()
 
     # ── Legacy handlers (for control dialog compatibility) ──
 
@@ -1239,17 +1704,6 @@ class MainWindow(QMainWindow):
         """Legacy: close camera."""
         self._on_close_camera()
 
-    def _on_pause_resume(self) -> None:
-        if not self._controller.is_detection_active:
-            return
-        if self._controller.is_paused:
-            self._controller.resume()
-        else:
-            self._controller.pause()
-        self._update_action_states()
-        if self._control_dialog:
-            self._control_dialog.set_paused(self._controller.is_paused)
-
     def _on_record_toggle(self) -> None:
         if self._controller.is_recording:
             self._controller.stop_recording()
@@ -1259,29 +1713,36 @@ class MainWindow(QMainWindow):
         if self._control_dialog:
             self._control_dialog.set_recording(self._controller.is_recording)
 
-    def _on_notification_toggle(self, checked: bool) -> None:
-        """Toggle notification on/off from menu."""
-        if checked:
-            self._controller.enable_notification()
-        else:
-            self._controller.disable_notification()
-        self._sync_notification_ui(checked)
+    def _on_notification_toggle(self, enabled: bool) -> None:
+        """Enable or disable notifications from menu / tray.
 
-    def _on_tray_notification_toggle(self) -> None:
-        """Toggle notification from tray menu."""
-        new_state = not self._controller.notification_enabled
-        self._notif_action.setChecked(new_state)
-        if new_state:
+        Called with ``True`` when the user picks "Enable Notification"
+        and ``False`` when the user picks "Disable Notification".
+        Idempotent: if the requested state already matches the
+        backend, the controller call is a no-op.
+        """
+        if enabled == self._controller.is_notification_enabled:
+            return
+        if enabled:
             self._controller.enable_notification()
         else:
             self._controller.disable_notification()
-        self._sync_notification_ui(new_state)
+        self._sync_notification_ui(enabled)
 
     def _sync_notification_ui(self, enabled: bool) -> None:
-        """Sync notification state across menu, tray, and HUD."""
-        label = "Notification: ON" if enabled else "Notification: OFF"
-        self._notif_action.setText(label)
-        self._tray_notif_action.setText(label)
+        """Sync notification state across menu, tray, and HUD.
+
+        The menu items themselves are no longer checkable — they
+        reflect the on/off state by being enabled or disabled, just
+        like the Camera menu's Open/Close pair. Only the action
+        representing the *opposite* of the current state is enabled
+        (you can disable a running notifier, but not "disable" a
+        notifier that's already off).
+        """
+        self._enable_notif_action.setEnabled(not enabled)
+        self._disable_notif_action.setEnabled(enabled)
+        self._tray_enable_notif_action.setEnabled(not enabled)
+        self._tray_disable_notif_action.setEnabled(enabled)
         self._preview.show_hud_temporarily()
 
     # ── State machine ─────────────────────────────────────────────────
@@ -1291,33 +1752,52 @@ class MainWindow(QMainWindow):
 
         State machine:
           IDLE        → camera off, detection off
+          OPENING     → camera init in progress (all actions disabled)
+          CLOSING     → camera teardown in progress (all actions disabled)
           CAMERA_ON   → camera on, detection off (preview only)
           DETECTING   → camera on, detection running
-          DET_PAUSED  → camera on, detection paused
+
+        The notification menu uses two separate Enable/Disable actions
+        whose enabled state is derived from ``is_notification_enabled``,
+        mirroring the Camera menu.
         """
         cam_open = self._controller.is_camera_open
+        busy = self._controller.is_busy
         det_active = self._controller.is_detection_active
-        det_paused = self._controller.is_paused
         recording = self._controller.is_recording
+        notif_on = self._controller.is_notification_enabled
+
+        # While open/close is in flight, lock out the camera actions
+        # so the user can't queue conflicting requests. Detection and
+        # recording actions are also locked out because they depend
+        # on a stable camera.
+        open_enabled = not cam_open and not busy
+        close_enabled = cam_open and not busy
 
         # Camera actions
-        self._open_cam_action.setEnabled(not cam_open)
-        self._close_cam_action.setEnabled(cam_open)
-        self._tray_open_cam_action.setEnabled(not cam_open)
-        self._tray_close_cam_action.setEnabled(cam_open)
-        self._refresh_cam_action.setEnabled(not cam_open)
+        self._open_cam_action.setEnabled(open_enabled)
+        self._close_cam_action.setEnabled(close_enabled)
+        self._tray_open_cam_action.setEnabled(open_enabled)
+        self._tray_close_cam_action.setEnabled(close_enabled)
+        self._refresh_cam_action.setEnabled(open_enabled)
 
         # Detection actions
-        self._start_det_action.setEnabled(cam_open and not det_active)
-        self._stop_det_action.setEnabled(det_active)
-        self._pause_action.setEnabled(det_active)
-        self._pause_action.setText("Resume" if det_paused else "Pause")
-        self._tray_start_det_action.setEnabled(cam_open and not det_active)
-        self._tray_stop_det_action.setEnabled(det_active)
+        self._start_det_action.setEnabled(cam_open and not det_active and not busy)
+        self._stop_det_action.setEnabled(det_active and not busy)
+        self._tray_start_det_action.setEnabled(cam_open and not det_active and not busy)
+        self._tray_stop_det_action.setEnabled(det_active and not busy)
 
         # Recording (only when detection is active)
-        self._record_action.setEnabled(det_active)
+        self._record_action.setEnabled(det_active and not busy)
         self._record_action.setText("Stop Recording" if recording else "Start Recording")
+
+        # Notification: enable whichever action represents the
+        # transition the user is allowed to make, mirroring the
+        # Camera menu (Open ↔ Close).
+        self._enable_notif_action.setEnabled(not notif_on)
+        self._disable_notif_action.setEnabled(notif_on)
+        self._tray_enable_notif_action.setEnabled(not notif_on)
+        self._tray_disable_notif_action.setEnabled(notif_on)
 
     def _toggle_fullscreen(self) -> None:
         if self.isFullScreen():
@@ -1338,12 +1818,9 @@ class MainWindow(QMainWindow):
             self._control_dialog = ControlDialog(self)
             self._control_dialog.start_requested.connect(self._on_start)
             self._control_dialog.stop_requested.connect(self._on_stop)
-            self._control_dialog.pause_requested.connect(self._on_pause_resume)
-            self._control_dialog.resume_requested.connect(self._on_pause_resume)
             self._control_dialog.start_recording_requested.connect(self._on_record_toggle)
             self._control_dialog.stop_recording_requested.connect(self._on_record_toggle)
         self._control_dialog.set_running(self._controller.is_running)
-        self._control_dialog.set_paused(self._controller.is_paused)
         self._control_dialog.set_recording(self._controller.is_recording)
         self._control_dialog.show()
         self._control_dialog.raise_()
@@ -1365,32 +1842,65 @@ class MainWindow(QMainWindow):
     # ── Timers ──
 
     def start_preview(self) -> None:
+        # Reset diagnostic flags so a re-open after close can re-log
+        self._first_frame_logged = False
+        self._no_frame_warned = False
         self._preview_timer.start()
         self._hud_timer.start()
+        self._update_action_states()
+        self._sync_notification_ui(self._controller.notification_enabled)
 
     def stop_preview(self) -> None:
         self._preview_timer.stop()
         self._hud_timer.stop()
+        self._update_action_states()
 
     def _update_preview(self) -> None:
         frame = self._controller.get_latest_frame()
         if frame is not None:
+            # First-frame diagnostic — helps catch pipeline issues
+            if not self._first_frame_logged:
+                self._first_frame_logged = True
+                self._logger.info(
+                    "First preview frame received: shape=%s, dtype=%s",
+                    frame.shape, frame.dtype,
+                )
             results = self._controller.get_latest_results()
             self._preview.update_frame(frame, results)
+        elif self._controller.is_camera_open and not self._first_frame_logged:
+            # Log a warning once if camera is open but no frames yet
+            if not hasattr(self, "_no_frame_warned") or not self._no_frame_warned:
+                self._no_frame_warned = True
+                self._logger.warning(
+                    "Camera is open but no frame has been cached yet. "
+                    "Pipeline may not be running (camera_open=%s, "
+                    "detection_running=%s)",
+                    self._controller.is_camera_open,
+                    self._controller.is_detection_active,
+                )
         # Keep init overlay sized to preview
         if self._init_overlay.isVisible():
             self._init_overlay.setGeometry(0, 0, self._preview.width(), self._preview.height())
+        # Always size and position the status panel in the top-left.
+        self._status_panel.setGeometry(
+            StatusPanel.PANEL_MARGIN,
+            StatusPanel.PANEL_MARGIN,
+            self._status_panel.sizeHint().width(),
+            self._status_panel.sizeHint().height(),
+        )
 
     def _update_hud(self) -> None:
         self._preview.update_hud(
             fps=self._controller.producer_fps,
             detection_count=self._controller.detection_count,
             running=self._controller.is_running,
-            paused=self._controller.is_paused,
             recording=self._controller.is_recording,
             notification_enabled=self._controller.notification_enabled,
             camera_open=self._controller.is_camera_open,
         )
+        # Mirror FPS into the persistent top-left panel so the
+        # diagnostic data lives on a single surface.
+        self._status_panel.update_fps(self._controller.producer_fps)
         if self._stats_dialog and self._stats_dialog.isVisible():
             self._stats_dialog.update_stats(
                 fps=self._controller.producer_fps,
@@ -1402,9 +1912,7 @@ class MainWindow(QMainWindow):
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         key = event.key()
-        if key == Qt.Key_Space:
-            self._on_pause_resume()
-        elif key == Qt.Key_Escape and self.isFullScreen():
+        if key == Qt.Key_Escape and self.isFullScreen():
             self.showNormal()
             self.menuBar().show()
         else:

@@ -107,25 +107,6 @@ class TestGatewayController:
             controller.stop()
             assert not controller.is_running
 
-    def test_pause_and_resume(self) -> None:
-        config = AppConfig()
-        config.detector.type = "mock"
-        controller = GatewayController(config)
-
-        with patch.object(controller, "_create_camera") as mock_create:
-            mock_camera = MagicMock()
-            mock_camera.read_frame.return_value = __import__("numpy").zeros(
-                (480, 640, 3), dtype=__import__("numpy").uint8
-            )
-            mock_create.return_value = mock_camera
-            controller.initialize()
-            controller.start()
-            controller.pause()
-            assert controller.is_paused
-            controller.resume()
-            assert not controller.is_paused
-            controller.stop()
-
     def test_filter_results(self) -> None:
         from larksnap.adapters.detector.interface import BBox, DetectionResult
 
