@@ -275,7 +275,21 @@ class InitOverlayWidget(QWidget):
         closes the camera, while the non-blocking gateway teardown is
         still in flight on a background thread)
       - ``closed``: hidden
+
+    The visual style (frosted glass background, spinning arc, accent
+    colour, text layout) and the transition duration are identical for
+    every state. Only the state-dependent text changes. This keeps the
+    open/close transitions visually consistent so the user perceives
+    a single, coherent flow rather than two separate animations.
     """
+
+    # ── Single source of truth for the transition style ──
+    # Used by every state so the open/close animations are visually
+    # indistinguishable apart from the text.
+    _FADE_DURATION_MS = 220
+    _SPIN_INTERVAL_MS = 30
+    _SPIN_STEP_DEG = 6  # 200 ms per full rotation
+    _ACCENT_COLOR = QColor(0, 120, 212)  # tech blue, same for all states
 
     STATE_WAITING = "waiting"
     STATE_LOADING_CAMERA = "loading_camera"
@@ -283,17 +297,44 @@ class InitOverlayWidget(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        # Start fully transparent so the first show fades in.
+        self.setWindowOpacity(0.0)
         self._angle = 0
         self._state = self.STATE_WAITING
         self._timer = QTimer(self)
-        self._timer.setInterval(30)
+        self._timer.setInterval(self._SPIN_INTERVAL_MS)
         self._timer.timeout.connect(self._rotate)
+        # The fade animation is created lazily on first use; reusing
+        # one QPropertyAnimation per show keeps state transitions
+        # clean and avoids leaking animation objects.
+        self._fade: QPropertyAnimation | None = None
         self.hide()
 
+    def _start_fade(self, target: float) -> None:
+        """Fade the overlay in or out to ``target`` opacity.
+
+        Always uses ``_FADE_DURATION_MS`` and the same easing curve
+        so the open/close transitions are visually identical.
+        """
+        if self._fade is not None and self._fade.state() == QPropertyAnimation.Running:
+            self._fade.stop()
+        self._fade = QPropertyAnimation(self, b"windowOpacity", self)
+        self._fade.setDuration(self._FADE_DURATION_MS)
+        self._fade.setEasingCurve(QEasingCurve.InOutCubic)
+        self._fade.setStartValue(self.windowOpacity())
+        self._fade.setEndValue(target)
+        self._fade.start()
+
     def show_overlay(self) -> None:
+        """Show the overlay and fade in using the standard duration.
+
+        Applies the same fade-in used by every other state so the
+        user perceives one consistent transition style.
+        """
         self.show()
         self.raise_()
         self._timer.start()
+        self._start_fade(1.0)
 
     def show_loading_camera(self) -> None:
         """Show the 'initialising camera' state. Used during background init."""
@@ -308,42 +349,64 @@ class InitOverlayWidget(QWidget):
         self.show_overlay()
 
     def hide_overlay(self) -> None:
+        """Fade out and stop the spinner.
+
+        Uses the same fade duration as ``show_overlay`` so closing
+        mirrors opening. The widget is hidden once the fade finishes
+        so the preview area below is never blocked by an opaque
+        overlay. If a fade is already in flight, it is restarted
+        cleanly from the current opacity.
+        """
+        if not self.isVisible():
+            return
         self._timer.stop()
-        self.hide()
+        self._start_fade(0.0)
+        # Hide the widget once the fade finishes. Doing the hide
+        # on the animation's finished signal keeps the widget out
+        # of the paint path during the transition itself, which
+        # matters for the close flow where the preview underneath
+        # is being updated in lock-step.
+        if self._fade is not None:
+            self._fade.finished.connect(self.hide)
 
     def _rotate(self) -> None:
-        self._angle = (self._angle + 6) % 360
+        self._angle = (self._angle + self._SPIN_STEP_DEG) % 360
         self.update()
 
     def paintEvent(self, event) -> None:
+        # Skip painting once the fade has fully dimmed us — avoids
+        # doing a paint pass for an invisible widget.
+        if self.windowOpacity() <= 0.0:
+            return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
 
-        # Frosted glass overlay
+        # Frosted glass overlay (single, identical alpha for every
+        # state so the user sees the same surface on open and close).
         painter.fillRect(self.rect(), QColor(245, 247, 250, 220))
 
         cx = self.width() // 2
         cy = self.height() // 2 - 30
 
-        # Spinning arc — tech blue
+        # Spinning arc — same colour and shape on open and close.
         painter.save()
         painter.translate(cx, cy)
         painter.rotate(self._angle)
 
-        pen = QPen(QColor(0, 120, 212), 4, Qt.SolidLine, Qt.RoundCap)
+        pen = QPen(self._ACCENT_COLOR, 4, Qt.SolidLine, Qt.RoundCap)
         painter.setPen(pen)
         painter.setBrush(Qt.NoBrush)
         rect = QRect(-24, -24, 48, 48)
         painter.drawArc(rect, 0, 270 * 16)
 
         # Small dot at the leading edge
-        painter.setBrush(QColor(0, 120, 212))
+        painter.setBrush(self._ACCENT_COLOR)
         painter.setPen(Qt.NoPen)
         painter.drawEllipse(20, -4, 8, 8)
 
         painter.restore()
 
-        # State-dependent text
+        # State-dependent text — only this differs between states.
         if self._state == self.STATE_LOADING_CAMERA:
             main_text = "正在初始化摄像头…"
             sub_text = "Initialising camera, please wait"
@@ -378,7 +441,6 @@ class VideoPreviewWidget(QWidget):
     """Full-area video preview with detection overlay and floating HUD."""
 
     _PALETTE = np.random.RandomState(42).randint(50, 255, size=(80, 3), dtype=np.uint8)
-    _MASK_ALPHA = 0.45
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -418,38 +480,50 @@ class VideoPreviewWidget(QWidget):
         display = frame.copy()
 
         if results:
-            overlay = display.copy()
-            fh, fw = display.shape[:2]
-            for result in results:
-                if result.mask is not None and result.mask.size > 0:
-                    mask = result.mask
-                    mh, mw = mask.shape[:2]
-                    # Resize mask to match frame if dimensions differ
-                    if mh != fh or mw != fw:
-                        mask = cv2.resize(
-                            mask.astype(np.float32),
-                            (fw, fh),
-                            interpolation=cv2.INTER_NEAREST,
-                        )
-                        mask = (mask > 0.5).astype(np.uint8)
-                    color = self._get_class_color(result.label)
-                    colored_mask = np.zeros_like(display)
-                    colored_mask[mask > 0] = color
-                    cv2.addWeighted(colored_mask, self._MASK_ALPHA, overlay, 1, 0, overlay)
-            cv2.addWeighted(overlay, self._MASK_ALPHA, display, 1 - self._MASK_ALPHA, 0, display)
-
+            # Draw bounding boxes + labels. We deliberately do NOT
+            # overlay segmentation masks on the live camera feed —
+            # the translucent fill would reduce clarity of the raw
+            # frame and obscure small objects. Segmentation results
+            # are still produced by the detector adapter and are
+            # available via the event bus for downstream consumers,
+            # but they are not painted here.
             for result in results:
                 color = self._get_class_color(result.label)
                 x, y = int(result.bbox.x), int(result.bbox.y)
                 w, h = int(result.bbox.width), int(result.bbox.height)
+                # Bounding box outline
                 cv2.rectangle(display, (x, y), (x + w, y + h), color.tolist(), 2)
+                # Label rendered INSIDE the bbox, anchored at the
+                # top-left corner. The coloured background bar plus
+                # white text keep the label readable regardless of
+                # the underlying pixel colours, and placing it
+                # inside the box prevents the label from being
+                # clipped when the bbox sits at the very top of
+                # the frame.
                 label_text = f"{result.label} {result.confidence:.1%}"
                 (tw, th), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-                cv2.rectangle(display, (x, y - th - 6), (x + tw, y), color.tolist(), -1)
-                cv2.putText(
-                    display, label_text, (x, y - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA,
-                )
+                pad_x, pad_y = 4, 3
+                # Clamp the label bar to the bbox bounds so it can
+                # never spill outside the rectangle (e.g. for a
+                # very thin or very short bbox).
+                bar_left = x + 1
+                bar_top = y + 1
+                bar_right = min(x + 1 + tw + 2 * pad_x, x + w - 1)
+                bar_bottom = min(y + 1 + th + 2 * pad_y, y + h - 1)
+                if bar_right > bar_left and bar_bottom > bar_top:
+                    cv2.rectangle(
+                        display,
+                        (bar_left, bar_top),
+                        (bar_right, bar_bottom),
+                        color.tolist(),
+                        -1,
+                    )
+                    text_x = bar_left + pad_x
+                    text_y = bar_bottom - pad_y - 1
+                    cv2.putText(
+                        display, label_text, (text_x, text_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA,
+                    )
 
         h, w = display.shape[:2]
         channels = display.shape[2] if display.ndim == 3 else 1
@@ -1765,6 +1839,11 @@ class MainWindow(QMainWindow):
         busy = self._controller.is_busy
         det_active = self._controller.is_detection_active
         recording = self._controller.is_recording
+        # Lock recording actions while a previous recording is
+        # still being flushed. Prevents the user from queuing a
+        # second start that the recorder would then refuse,
+        # which would feel like the button is broken.
+        draining = self._controller.is_recording_draining
         notif_on = self._controller.is_notification_enabled
 
         # While open/close is in flight, lock out the camera actions
@@ -1787,8 +1866,15 @@ class MainWindow(QMainWindow):
         self._tray_start_det_action.setEnabled(cam_open and not det_active and not busy)
         self._tray_stop_det_action.setEnabled(det_active and not busy)
 
-        # Recording (only when detection is active)
-        self._record_action.setEnabled(det_active and not busy)
+        # Recording (only when detection is active and not
+        # currently draining the previous file). When the user
+        # clicks "Stop Recording", the button is immediately
+        # re-enabled as "Start Recording" because the new
+        # ``stop_recording`` is non-blocking — the actual file
+        # release happens on a background thread and just keeps
+        # the action disabled while in flight.
+        record_enabled = det_active and not busy and not draining
+        self._record_action.setEnabled(record_enabled)
         self._record_action.setText("Stop Recording" if recording else "Start Recording")
 
         # Notification: enable whichever action represents the
@@ -1901,6 +1987,14 @@ class MainWindow(QMainWindow):
         # Mirror FPS into the persistent top-left panel so the
         # diagnostic data lives on a single surface.
         self._status_panel.update_fps(self._controller.producer_fps)
+        # The recording button depends on the recorder's "draining"
+        # state, which transitions off the UI thread when the file
+        # finalizer finishes. Refresh action states from the same
+        # tick so the button re-enables itself within ~200 ms of
+        # the flush completing — no user-visible delay and no
+        # blocked UI thread.
+        if self._controller.is_recording_draining:
+            self._update_action_states()
         if self._stats_dialog and self._stats_dialog.isVisible():
             self._stats_dialog.update_stats(
                 fps=self._controller.producer_fps,

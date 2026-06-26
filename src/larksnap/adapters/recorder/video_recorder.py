@@ -14,6 +14,15 @@ Concurrency:
     ``_writer``, ``_current_file``). The per-frame write path is
     lock-free, eliminating the bottleneck that previously caused
     the recorder to drop frames under load.
+  - ``stop_recording`` is non-blocking on the caller's thread:
+    it only flips the recording flag, stops the consumer, and
+    hands the writer release off to a background worker. The
+    previous implementation blocked the calling thread (often
+    the Qt main thread) for up to several seconds while waiting
+    for the in-flight writes to drain and ``VideoWriter.release``
+    to flush the file, which froze the UI on every stop click.
+    Callers that need a "fully flushed" guarantee can use
+    ``wait_drained(timeout)``.
 """
 
 from __future__ import annotations
@@ -79,11 +88,31 @@ class VideoRecorderAdapter(BaseAdapter):
         self._last_queued_seq: int = -1
         self._in_flight: int = 0
         self._in_flight_lock = threading.Lock()
+        # Drain coordination. ``_draining`` is True between
+        # ``stop_recording`` returning and the writer actually
+        # being released by the background finalizer. ``_drain_done``
+        # is set once the file is fully flushed. The split is
+        # what lets ``stop_recording`` return immediately while
+        # still allowing shutdown paths to wait synchronously.
+        self._draining: bool = False
+        self._drain_done = threading.Event()
+        self._drain_done.set()  # idle at start
 
     @property
     def is_recording(self) -> bool:
         with self._lock:
             return self._recording
+
+    @property
+    def is_draining(self) -> bool:
+        """True between ``stop_recording`` returning and the file
+        being fully flushed to disk.
+
+        Lets the UI show a brief "saving…" hint and lets the
+        controller refuse to start a new recording until the
+        previous one is safely on disk.
+        """
+        return self._draining
 
     @property
     def current_file(self) -> str | None:
@@ -116,10 +145,27 @@ class VideoRecorderAdapter(BaseAdapter):
         self.stop_recording()
 
     def start_recording(self, context=None) -> None:
-        """Start recording frames from the frame queue."""
+        """Start recording frames from the frame queue.
+
+        Refuses to start while a previous recording is still being
+        drained to disk (``_draining``). Callers that need to
+        guarantee a clean transition should call ``wait_drained``
+        first; the controller's close worker does this.
+        """
         with self._lock:
             if self._recording:
                 self._logger.warning("Already recording")
+                return
+            if self._draining:
+                # A previous recording is still being flushed. To
+                # avoid corrupting the in-progress mp4 by opening
+                # a second writer over it, we just refuse. The UI
+                # sees ``is_recording == False`` and the user can
+                # click record again once draining finishes.
+                self._logger.warning(
+                    "Recorder is still draining the previous file; "
+                    "ignoring start_recording()"
+                )
                 return
 
             self._frame_count = 0
@@ -137,16 +183,40 @@ class VideoRecorderAdapter(BaseAdapter):
                 context=context,
             )
             self._recording = True
+            self._drain_done.set()  # nothing in flight
             self._logger.info("Video recording started")
 
     def stop_recording(self, drain_timeout: float = 2.0) -> None:
         """Stop recording and close the video file.
 
-        Waits up to ``drain_timeout`` seconds for in-flight write
-        tasks to finish so the output file is flushed to disk.
+        Non-blocking on the caller's thread. The method only:
+          1. flips the recording flag (so ``is_recording`` returns
+             False immediately and the UI can react),
+          2. stops the ZMQ consumer (bounded by the consumer's
+             own internal timeout),
+          3. snapshots the writer reference,
+          4. dispatches the actual file flush + ``VideoWriter.release``
+             to a background worker.
+
+        The previous implementation blocked here for up to
+        ``drain_timeout`` seconds, which froze the Qt main thread
+        every time the user clicked "Stop recording". With the
+        file release offloaded, the UI stays responsive and the
+        user can immediately click "Start recording" again — the
+        recorder will reject the new start if the previous drain
+        hasn't finished (see ``is_draining``) so the file is
+        never corrupted.
+
+        For shutdown paths (e.g. closing the camera) that need to
+        guarantee the file is fully written, call
+        ``wait_drained(timeout)`` after this method returns.
         """
         with self._lock:
-            if not self._recording:
+            if not self._recording and not self._draining:
+                return
+            if not self._recording and self._draining:
+                # Already stopping; do nothing. The background
+                # finalizer is in charge of releasing the writer.
                 return
 
             self._recording = False
@@ -158,37 +228,100 @@ class VideoRecorderAdapter(BaseAdapter):
             local_file = self._current_file
             local_frame_count = self._frame_count
             local_duration = self.duration
-            # We close the writer AFTER the worker has finished so
-            # pending writes see a valid writer. Don't release here.
+            # Mark draining BEFORE releasing the lock so a
+            # concurrent start_recording sees it and refuses.
+            self._draining = True
+            self._drain_done.clear()
 
-        # Wait for any in-flight writes to drain (bounded).
-        if last_queued >= 0 and self._worker_pool is not None:
-            deadline = time.time() + drain_timeout
-            while time.time() < deadline:
-                with self._in_flight_lock:
-                    if self._in_flight <= 0:
-                        break
-                time.sleep(0.01)
-            else:
-                self._logger.warning(
-                    "Recorder stop timed out waiting for %d in-flight write(s)",
-                    self._in_flight,
-                )
+        # Hand the final release to a background worker so the
+        # caller's thread returns immediately. We do not hold the
+        # lock during the finalizer — it acquires the lock only
+        # briefly to clear ``_writer`` / ``_current_file``.
+        finalizer = threading.Thread(
+            target=self._finalize_release,
+            args=(
+                local_writer, local_file,
+                local_frame_count, local_duration,
+                last_queued, drain_timeout,
+            ),
+            daemon=True,
+            name="VideoRecorder-finalize",
+        )
+        finalizer.start()
 
-        with self._lock:
-            if local_writer is not None:
+    def _finalize_release(
+        self,
+        writer: cv2.VideoWriter | None,
+        out_file: str | None,
+        frames: int,
+        duration: float,
+        last_queued: int,
+        drain_timeout: float,
+    ) -> None:
+        """Background finalizer: drain in-flight writes and close the file.
+
+        Runs on a dedicated daemon thread so the caller's thread
+        is never blocked on disk I/O. Catches and logs every error
+        because the caller can no longer see exceptions (they're
+        already gone by the time we get here).
+        """
+        try:
+            # Wait for in-flight writes to drain (bounded). This
+            # is the only blocking step in the new flow, and it
+            # now runs off the UI thread.
+            if last_queued >= 0 and self._worker_pool is not None:
+                deadline = time.time() + drain_timeout
+                while time.time() < deadline:
+                    with self._in_flight_lock:
+                        if self._in_flight <= 0:
+                            break
+                    time.sleep(0.01)
+                else:
+                    with self._in_flight_lock:
+                        remaining = self._in_flight
+                    if remaining > 0:
+                        self._logger.warning(
+                            "Recorder stop timed out waiting for %d "
+                            "in-flight write(s)", remaining,
+                        )
+            if writer is not None:
                 try:
-                    local_writer.release()
+                    writer.release()
                 except Exception as e:  # noqa: BLE001
-                    self._logger.error("VideoWriter release failed: %s", e)
+                    self._logger.error(
+                        "VideoWriter release failed: %s", e,
+                    )
+            self._logger.info(
+                "Video recording stopped: %s (%d frames, %.1fs)",
+                out_file, frames, duration,
+            )
+        except Exception as e:  # noqa: BLE001
+            # Defensive: never let the finalizer die silently.
+            self._logger.error(
+                "Recorder finalizer crashed: %s", e, exc_info=True,
+            )
+        finally:
+            # Always clear state, even on error, so the recorder
+            # is usable for the next session.
+            with self._lock:
                 self._writer = None
-                self._logger.info(
-                    "Video recording stopped: %s (%d frames, %.1fs)",
-                    local_file,
-                    local_frame_count,
-                    local_duration,
-                )
-            self._current_file = None
+                self._current_file = None
+                self._draining = False
+            self._drain_done.set()
+
+    def wait_drained(self, timeout: float | None = None) -> bool:
+        """Block until any in-flight ``stop_recording`` finalizes.
+
+        Returns True if drain completed within ``timeout``,
+        False otherwise (or if the recorder is idle).
+
+        Used by shutdown paths (e.g. ``_close_camera_worker``)
+        that must guarantee the file is fully flushed before
+        tearing the rest of the pipeline down.
+        """
+        if not self._drain_done.wait(timeout):
+            return False
+        return True
 
     def _on_frame(self, packet: FramePacket) -> None:
         """Handle a frame from the consumer.

@@ -86,11 +86,27 @@ class GatewayConfig(BaseModel):
 
 
 class ServiceConfig(BaseModel):
-    """Windows service configuration."""
+    """OS service configuration.
 
-    name: str = "LarkSnap"
+    The same name/description fields drive both the Windows service
+    registry entry and the systemd unit file. The ``exec_*`` fields
+    let packagers override the launcher path / user without rewriting
+    the generated unit.
+    """
+
+    name: str = "larksnap"
     display_name: str = "LarkSnap Detection Service"
     description: str = "Gateway-controlled object detection system"
+
+    # systemd-specific knobs (no effect on Windows).
+    systemd_unit_path: str = "/etc/systemd/system/larksnap.service"
+    systemd_user: str | None = None  # run as this user (None = root)
+    systemd_type: str = "notify"  # "notify" | "simple" | "forking"
+    systemd_restart: str = "on-failure"
+    systemd_wanted_by: str = "multi-user.target"
+
+    # Windows-specific knobs (no effect on Linux).
+    windows_start_type: str = "auto"  # "auto" | "manual" | "disabled"
 
 
 class LoggingConfig(BaseModel):

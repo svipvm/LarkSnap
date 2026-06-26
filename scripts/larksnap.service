@@ -1,0 +1,39 @@
+# LarkSnap systemd unit template
+#
+# Copy this file to /etc/systemd/system/larksnap.service and
+# adjust the ExecStart line to match your environment. Most users
+# will never need to touch it directly — `scripts/install_service.sh`
+# generates it automatically from the YAML config.
+
+[Unit]
+Description=LarkSnap Detection Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+# Adjust the python / uv path to your environment. When uv is
+# installed, the install script will use ``uv run`` so the lock
+# file pins the dependency set in production.
+ExecStart=/usr/bin/python3 -m larksnap.main service
+WorkingDirectory=/opt/larksnap
+
+# Uncomment to run as a non-root user.
+# User=larksnap
+# Group=larksnap
+
+Restart=on-failure
+RestartSec=5
+
+# Hardening (recommended).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/larksnap /opt/larksnap/snapshots /opt/larksnap/recordings
+
+StandardOutput=append:/var/log/larksnap.log
+StandardError=append:/var/log/larksnap.log
+
+[Install]
+WantedBy=multi-user.target

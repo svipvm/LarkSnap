@@ -31,16 +31,29 @@ def _make_mock_camera() -> MagicMock:
     return cam
 
 
-def _make_controller_with_mock_camera() -> GatewayController:
+def _make_controller_with_mock_camera(
+    tmp_path_factory: pytest.TempPathFactory | None = None,
+) -> GatewayController:
+    """Build a controller pointed at a mock camera.
+
+    Uses a per-test state file under a temporary directory so the
+    state persistence feature (which writes to %APPDATA%/LarkSnap
+    by default) does not leak between tests and cannot influence
+    one test from a previous one.
+    """
     cfg = AppConfig()
     cfg.detector.type = "mock"
     cfg.camera.device_index = 999  # ensure no real camera
-    return GatewayController(cfg)
+    if tmp_path_factory is not None:
+        state_path = tmp_path_factory.mktemp("runtime_state") / "runtime_state.json"
+    else:
+        state_path = None
+    return GatewayController(cfg, state_path=state_path)
 
 
-def test_state_machine_initial_state() -> None:
+def test_state_machine_initial_state(tmp_path_factory) -> None:
     """New controller must be in IDLE state."""
-    controller = _make_controller_with_mock_camera()
+    controller = _make_controller_with_mock_camera(tmp_path_factory)
     assert controller.state == GatewayState.IDLE
     assert controller.is_camera_open is False
     assert controller.is_running is False
@@ -59,13 +72,13 @@ def test_state_transitions_are_validated() -> None:
     assert GatewayState.IDLE not in _ALLOWED_TRANSITIONS[GatewayState.CAMERA_ON]
 
 
-def test_open_camera_starts_pipeline_immediately() -> None:
+def test_open_camera_starts_pipeline_immediately(tmp_path_factory) -> None:
     """Primary fix: opening the camera must start the pipeline right away.
 
     Before the fix, the pipeline was only created (not started) by
     open_camera(), so users in CAMERA_ON state saw no frames.
     """
-    controller = _make_controller_with_mock_camera()
+    controller = _make_controller_with_mock_camera(tmp_path_factory)
     mock_cam = _make_mock_camera()
 
     with patch.object(controller, "_create_adapters") as mock_create:
@@ -113,9 +126,9 @@ def test_open_camera_starts_pipeline_immediately() -> None:
             controller.stop()
 
 
-def test_close_camera_is_non_blocking() -> None:
+def test_close_camera_is_non_blocking(tmp_path_factory) -> None:
     """close_camera() must return quickly even when ZMQ teardown is slow."""
-    controller = _make_controller_with_mock_camera()
+    controller = _make_controller_with_mock_camera(tmp_path_factory)
 
     def _install() -> None:
         controller._camera = _make_mock_camera()
@@ -143,9 +156,9 @@ def test_close_camera_is_non_blocking() -> None:
         controller.stop()
 
 
-def test_double_open_is_noop() -> None:
+def test_double_open_is_noop(tmp_path_factory) -> None:
     """Calling open_camera() twice without closing should be rejected."""
-    controller = _make_controller_with_mock_camera()
+    controller = _make_controller_with_mock_camera(tmp_path_factory)
 
     def _install() -> None:
         controller._camera = _make_mock_camera()
@@ -163,9 +176,9 @@ def test_double_open_is_noop() -> None:
         controller.stop()
 
 
-def test_open_while_closing_is_rejected() -> None:
+def test_open_while_closing_is_rejected(tmp_path_factory) -> None:
     """open_camera() during an in-flight close must be rejected, not crash."""
-    controller = _make_controller_with_mock_camera()
+    controller = _make_controller_with_mock_camera(tmp_path_factory)
 
     def _install() -> None:
         controller._camera = _make_mock_camera()
@@ -184,9 +197,9 @@ def test_open_while_closing_is_rejected() -> None:
         controller.stop()
 
 
-def test_event_subscription_dedup() -> None:
+def test_event_subscription_dedup(tmp_path_factory) -> None:
     """Repeated subscribe() calls for the same handler must not stack up."""
-    controller = _make_controller_with_mock_camera()
+    controller = _make_controller_with_mock_camera(tmp_path_factory)
 
     def _install() -> None:
         controller._camera = _make_mock_camera()
@@ -215,9 +228,9 @@ def test_event_subscription_dedup() -> None:
         controller.stop()
 
 
-def test_start_stop_detection_state_transitions() -> None:
+def test_start_stop_detection_state_transitions(tmp_path_factory) -> None:
     """start_detection() / stop_detection() must use the new state enum."""
-    controller = _make_controller_with_mock_camera()
+    controller = _make_controller_with_mock_camera(tmp_path_factory)
 
     def _install() -> None:
         controller._camera = _make_mock_camera()
@@ -243,9 +256,9 @@ def test_start_stop_detection_state_transitions() -> None:
         controller.stop()
 
 
-def test_is_busy_during_close() -> None:
+def test_is_busy_during_close(tmp_path_factory) -> None:
     """is_busy must be True while close is in flight."""
-    controller = _make_controller_with_mock_camera()
+    controller = _make_controller_with_mock_camera(tmp_path_factory)
 
     def _install() -> None:
         controller._camera = _make_mock_camera()
@@ -266,9 +279,9 @@ def test_is_busy_during_close() -> None:
         controller.stop()
 
 
-def test_close_during_close_is_safe() -> None:
+def test_close_during_close_is_safe(tmp_path_factory) -> None:
     """Calling close_camera() twice in a row must not crash."""
-    controller = _make_controller_with_mock_camera()
+    controller = _make_controller_with_mock_camera(tmp_path_factory)
 
     def _install() -> None:
         controller._camera = _make_mock_camera()
@@ -286,12 +299,12 @@ def test_close_during_close_is_safe() -> None:
         controller.stop()
 
 
-def test_recover_from_fatal_pipeline_error() -> None:
+def test_recover_from_fatal_pipeline_error(tmp_path_factory) -> None:
     """A fatal pipeline error must take the gateway back to IDLE.
 
     The user must be able to re-open the camera after a read failure.
     """
-    controller = _make_controller_with_mock_camera()
+    controller = _make_controller_with_mock_camera(tmp_path_factory)
 
     def _install() -> None:
         controller._camera = _make_mock_camera()
@@ -325,7 +338,7 @@ def test_recover_from_fatal_pipeline_error() -> None:
 # ── Runtime state persistence across close/open ───────────────────────
 
 
-def test_state_persisted_on_close_and_restored_on_open(tmp_path) -> None:
+def test_state_persisted_on_close_and_restored_on_open(tmp_path, tmp_path_factory) -> None:
     """Detector + notifier state must survive a close/open cycle.
 
     The user-facing behaviour: closing the camera while detection
@@ -339,7 +352,7 @@ def test_state_persisted_on_close_and_restored_on_open(tmp_path) -> None:
     from larksnap.gateway.notification_service import NotificationService, NotificationServiceConfig
 
     state_file = tmp_path / "runtime_state.json"
-    controller = _make_controller_with_mock_camera()
+    controller = _make_controller_with_mock_camera(tmp_path_factory)
     # Redirect persistence to a per-test location.
     controller._state_path = state_file
 
@@ -388,9 +401,10 @@ def test_state_persisted_on_close_and_restored_on_open(tmp_path) -> None:
         assert state_file.exists(), "State file was not written on close"
 
     # Reopen with a brand-new controller to simulate a process
-    # restart (adapters cleared, but state file on disk).
-    controller2 = _make_controller_with_mock_camera()
-    controller2._state_path = state_file
+    # restart (adapters cleared, but state file on disk). Reuse
+    # the same state file so the new controller reads the
+    # persisted state on open.
+    controller2 = GatewayController(AppConfig(), state_path=state_file)
 
     def _install2() -> None:
         controller2._camera = _make_mock_camera()
@@ -418,13 +432,13 @@ def test_state_persisted_on_close_and_restored_on_open(tmp_path) -> None:
         controller2.stop()
 
 
-def test_state_restore_is_noop_when_file_missing(tmp_path) -> None:
+def test_state_restore_is_noop_when_file_missing(tmp_path, tmp_path_factory) -> None:
     """No state file → no restoration → fresh defaults apply.
 
     The first-ever run must behave exactly like before this
     feature was added: detector off (CAMERA_ON), notifier enabled.
     """
-    controller = _make_controller_with_mock_camera()
+    controller = _make_controller_with_mock_camera(tmp_path_factory)
     controller._state_path = tmp_path / "does_not_exist.json"
 
     def _install() -> None:

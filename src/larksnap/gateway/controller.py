@@ -659,10 +659,19 @@ class GatewayController:
         try:
             self._logger.info("Closing camera (background)...")
 
-            # Stop recording first (fast, in-process)
-            if self._recorder is not None and self._recorder.is_recording:
+            # Stop recording first and wait for the recorder to
+            # fully flush the in-flight writes to disk. We do this
+            # on the close worker (NOT the UI thread) so the user
+            # can keep interacting with the menu while the file
+            # is being finalised. The recorder's stop_recording
+            # itself is non-blocking, so this wait is the only
+            # blocking step and it now runs off the UI thread.
+            if self._recorder is not None and (
+                self._recorder.is_recording or self._recorder.is_draining
+            ):
                 try:
                     self._recorder.stop_recording()
+                    self._recorder.wait_drained(timeout=5.0)
                 except Exception as e:
                     self._logger.error("Stop recording during close failed: %s", e)
 
@@ -828,7 +837,21 @@ class GatewayController:
 
     def stop_recording(self) -> None:
         if self._recorder is not None:
+            # Non-blocking: ``stop_recording`` only flips state and
+            # dispatches the file release to a background worker.
+            # The UI updates immediately because ``is_recording``
+            # returns False right after this call. The file is
+            # fully written a moment later by the recorder's
+            # finalizer thread.
             self._recorder.stop_recording()
+
+    @property
+    def is_recording_draining(self) -> bool:
+        """True while a previously stopped recording is still being
+        flushed to disk. Used by the UI to disable re-recording
+        briefly and to show a "saving" hint.
+        """
+        return self._recorder is not None and self._recorder.is_draining
 
     # ── Notification ──────────────────────────────────────────────────
 

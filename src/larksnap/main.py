@@ -1,10 +1,23 @@
 """LarkSnap application entry point.
 
 Supports multiple run modes:
-  - qt:     PySide6 GUI mode (default)
-  - tray:   System tray mode (headless)
-  - service: Windows service mode
+
+  - qt:      PySide6 GUI mode (default)
+  - tray:    System tray mode (headless, user can quit from tray icon)
+  - service: Foreground process that runs the controller until a stop
+             signal arrives. On Windows this is the SCM dispatch entry
+             point; on Linux it's a foreground equivalent of the
+             systemd unit (handy for debugging).
+
+In addition, two subcommands manage the platform service registration:
+
+  - install:   register with the OS (Windows SCM, systemd unit, …)
+  - uninstall: remove the registration
+
+Run ``larksnap --help`` for the full list.
 """
+
+from __future__ import annotations
 
 import argparse
 import logging
@@ -13,6 +26,10 @@ import sys
 
 from larksnap.config.loader import load_config
 from larksnap.gateway.controller import GatewayController
+from larksnap.service.platform_utils import (
+    ServicePlatform,
+    current_service_platform,
+)
 from larksnap.utils.logger import setup_logger
 
 
@@ -20,7 +37,7 @@ def _build_parser() -> argparse.ArgumentParser:
     """Build the command-line argument parser."""
     parser = argparse.ArgumentParser(
         prog="larksnap",
-        description="Gateway-controlled object detection system",
+        description="Cross-platform gateway-controlled object detection system",
     )
     parser.add_argument(
         "-c",
@@ -33,9 +50,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("qt", help="Run with PySide6 GUI (default)")
     subparsers.add_parser("tray", help="Run with system tray (headless)")
-    subparsers.add_parser("service", help="Run as Windows service")
-    subparsers.add_parser("install", help="Install Windows service")
-    subparsers.add_parser("uninstall", help="Uninstall Windows service")
+    subparsers.add_parser("service", help="Run as a background service")
+    subparsers.add_parser(
+        "install",
+        help="Register the service with the OS (SCM on Windows, systemd on Linux)",
+    )
+    subparsers.add_parser(
+        "uninstall",
+        help="Unregister the service from the OS",
+    )
 
     return parser
 
@@ -133,14 +156,14 @@ def run_with_tray(config_path: str | None) -> None:
         console_output=config.logging.console_output,
     )
 
-    logger.info("Starting LarkSnap...")
+    logger.info("Starting LarkSnap (tray mode)...")
 
     controller = GatewayController(config)
     controller.initialize()
 
     tray = SystemTray(controller)
 
-    def _signal_handler(sig: int, frame: object) -> None:
+    def _signal_handler(sig: int, _frame: object) -> None:
         logger.info("Received shutdown signal, stopping...")
         tray.stop()
 
@@ -152,25 +175,63 @@ def run_with_tray(config_path: str | None) -> None:
     logger.info("LarkSnap exited.")
 
 
-def run_as_service(config_path: str | None) -> None:
-    """Run the application as a Windows service."""
-    from larksnap.service.windows_service import run_service
+def run_as_service(config_path: str | None) -> int:
+    """Run the service body, dispatching to the platform wrapper.
 
-    run_service()
+    - Windows: hand control to the SCM via
+      :func:`larksnap.service.windows.run_windows_service`.
+    - Linux:   run the foreground body in
+      :func:`larksnap.service.linux.run_linux_service`. systemd
+      already does the SCM-equivalent work for us; this is what
+      ``systemctl start larksnap`` ends up executing.
+    - Other POSIX: same as Linux minus the ``sd_notify`` call
+      (systemd isn't present).
+
+    Returns the platform-specific exit code.
+    """
+    platform = current_service_platform()
+
+    if platform is ServicePlatform.WINDOWS:
+        from larksnap.service.windows import run_windows_service
+
+        return run_windows_service()
+
+    if platform is ServicePlatform.LINUX:
+        from larksnap.service.linux import run_linux_service
+
+        run_linux_service(config_path)
+        return 0
+
+    # Fallback: macOS / BSDs / unknown. Run a plain signal-based
+    # service body (no installer hint, no auto-start).
+    from larksnap.service.runner import (
+        ServiceRunner,
+        install_posix_stop_handlers,
+        run_service_blocking,
+    )
+
+    runner = ServiceRunner(config_path=config_path)
+    install_posix_stop_handlers(runner)
+    run_service_blocking(config_path=config_path)
+    return 0
 
 
-def install_service(config_path: str | None) -> None:
-    """Install the application as a Windows service."""
-    from larksnap.service.windows_service import install_service
+def install_service_command() -> int:
+    """Register LarkSnap as an OS service.
 
-    install_service()
+    Thin wrapper over :func:`larksnap.service.install_service` that
+    handles the CLI exit code plumbing.
+    """
+    from larksnap.service import install_service
+
+    return install_service()
 
 
-def uninstall_service(config_path: str | None) -> None:
-    """Uninstall the Windows service."""
-    from larksnap.service.windows_service import uninstall_service
+def uninstall_service_command() -> int:
+    """Unregister LarkSnap from the OS service manager."""
+    from larksnap.service import uninstall_service
 
-    uninstall_service()
+    return uninstall_service()
 
 
 def main() -> None:
@@ -183,16 +244,19 @@ def main() -> None:
 
     if command == "qt":
         run_with_qt(config_path)
-    elif command == "tray":
+        return
+    if command == "tray":
         run_with_tray(config_path)
-    elif command == "service":
-        run_as_service(config_path)
-    elif command == "install":
-        install_service(config_path)
-    elif command == "uninstall":
-        uninstall_service(config_path)
-    else:
-        parser.print_help()
+        return
+    if command == "service":
+        sys.exit(run_as_service(config_path))
+    if command == "install":
+        sys.exit(install_service_command())
+    if command == "uninstall":
+        sys.exit(uninstall_service_command())
+
+    parser.print_help()
+    sys.exit(2)
 
 
 if __name__ == "__main__":
