@@ -13,6 +13,7 @@ import numpy as np
 from PySide6.QtCore import (
     QEasingCurve,
     QObject,
+    QPointF,
     QPropertyAnimation,
     QRect,
     QSize,
@@ -22,22 +23,27 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QAction,
+    QBrush,
     QColor,
     QFont,
     QIcon,
     QImage,
-    QKeyEvent,
     QMouseEvent,
     QPainter,
     QPen,
     QPixmap,
+    QPolygonF,
+    QStandardItem,
+    QStandardItemModel,
 )
 from PySide6.QtWidgets import (
+    QAbstractSpinBox,
     QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
     QDoubleSpinBox,
+    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -47,10 +53,12 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QSpinBox,
     QStatusBar,
     QSystemTrayIcon,
     QTabWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -178,15 +186,95 @@ QTabBar::tab:selected {
     border-bottom-color: #ffffff;
     font-weight: 600;
 }
-QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
+QLineEdit, QComboBox {
     background-color: #ffffff;
     border: 1px solid #c0c8d4;
     border-radius: 6px;
     padding: 6px 10px;
     color: #2c3e50;
 }
+QSpinBox, QDoubleSpinBox {
+    background-color: #ffffff;
+    border: 1px solid #c0c8d4;
+    border-radius: 6px;
+    padding: 5px 8px 5px 10px;
+    color: #2c3e50;
+    selection-background-color: #c8ddf5;
+    selection-color: #005a9e;
+    min-height: 18px;
+}
 QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {
     border-color: #0078d4;
+}
+QSpinBox:disabled, QDoubleSpinBox:disabled {
+    color: #b0b8c4;
+    background-color: #f5f7fa;
+    border-color: #e0e4ea;
+}
+/* The up/down steppers are real QToolButton children of the
+   StepSpinBox / StepDoubleSpinBox composite widgets further down
+   this module — styling for them lives next to those classes and
+   applies via objectName selectors, not via QSS sub-controls. */
+/* ── Composite step spinbox (StepSpinBox / StepDoubleSpinBox) ──────
+   The inner QSpinBox keeps its left/top/bottom border + left
+   rounded corners and drops the right border / right corners.
+   The step container on the right provides the right border,
+   the rounded right corners and a subtle gradient body.  A
+   1px hairline between up and down splits the container visually.
+   Arrows are QPainter-rendered polygons (see _StepButton), so
+   they always render regardless of image-plugin configuration. */
+QWidget#StepSpinBox > QSpinBox#step_inner,
+QWidget#StepSpinBox > QDoubleSpinBox#step_inner {
+    border-top-right-radius: 0;
+    border-bottom-right-radius: 0;
+    border-right: 1px solid #d8dde4;
+    padding-right: 8px;
+    background-color: #ffffff;
+}
+QWidget#StepSpinBox > QFrame#step_container {
+    background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #fafbfc, stop:1 #eef1f5);
+    border-top: 1px solid #c0c8d4;
+    border-right: 1px solid #c0c8d4;
+    border-bottom: 1px solid #c0c8d4;
+    border-left: none;
+    border-top-right-radius: 6px;
+    border-bottom-right-radius: 6px;
+}
+QWidget#StepSpinBox > QFrame#step_container > QToolButton#step_up,
+QWidget#StepSpinBox > QFrame#step_container > QToolButton#step_down {
+    background: transparent;
+    border: none;
+    border-radius: 0;
+    padding: 0;
+    margin: 0;
+}
+QWidget#StepSpinBox > QFrame#step_container > QToolButton#step_up {
+    border-top-right-radius: 6px;
+}
+QWidget#StepSpinBox > QFrame#step_container > QToolButton#step_up:hover {
+    background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #e8f0fe, stop:1 #d4e4fc);
+}
+QWidget#StepSpinBox > QFrame#step_container > QToolButton#step_up:pressed {
+    background-color: #c8ddf5;
+}
+QWidget#StepSpinBox > QFrame#step_container > QToolButton#step_down {
+    border-bottom-right-radius: 6px;
+}
+QWidget#StepSpinBox > QFrame#step_container > QToolButton#step_down:hover {
+    background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #d4e4fc, stop:1 #e8f0fe);
+}
+QWidget#StepSpinBox > QFrame#step_container > QToolButton#step_down:pressed {
+    background-color: #c8ddf5;
+}
+QWidget#StepSpinBox > QFrame#step_container > QToolButton#step_up:disabled,
+QWidget#StepSpinBox > QFrame#step_container > QToolButton#step_down:disabled {
+    background-color: #f5f7fa;
+}
+QWidget#StepSpinBox > QFrame#step_container > QFrame#step_hairline {
+    background-color: #d8dde4;
+    border: none;
+    max-height: 1px;
+    min-height: 1px;
 }
 QCheckBox::indicator {
     width: 18px;
@@ -845,139 +933,264 @@ class StatusPanel(QWidget):
         painter.end()
 
 
-# ─── Control Dialog ───────────────────────────────────────────────────
+# ─── Composite Step Spinbox ──────────────────────────────────────────
+# Replaces the native QSpinBox/QDoubleSpinBox for the Settings UI.
+# The platform's QSS sub-control steppers rendered without a visible
+# body / arrow on this Qt build, so the steppers here are real
+# QToolButton children with arrows painted via QPainter.  This is
+# guaranteed to render on every platform regardless of the image
+# plugin configuration.
 
-class ControlDialog(QDialog):
-    """Floating control panel as a dialog, accessible from menu."""
 
-    start_requested = Signal()
-    stop_requested = Signal()
-    start_recording_requested = Signal()
-    stop_recording_requested = Signal()
+class _StepButton(QToolButton):
+    """Stepper button with a hand-painted triangular arrow.
+
+    The triangle is drawn on top of the (possibly QSS-styled) button
+    background using QPainter.  This avoids the silent-failure path
+    of QSS ``image: url(data:image/svg+xml;base64,...)`` on builds
+    that don't ship the Qt SVG image plugin.
+    """
+
+    _HALF_W = 4.0
+    _HALF_H = 2.0
+
+    def __init__(self, direction: str, parent: QWidget | None = None) -> None:
+        if direction not in ("up", "down"):
+            raise ValueError(
+                f"direction must be 'up' or 'down', got {direction!r}"
+            )
+        super().__init__(parent)
+        self._direction = direction
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFocusPolicy(Qt.NoFocus)
+        self.setObjectName(f"step_{direction}")
+        # Hold-to-repeat gives the same feel as the native stepper.
+        self.setAutoRepeat(True)
+        self.setAutoRepeatDelay(350)
+        self.setAutoRepeatInterval(60)
+        # Fixed width — the two stacked buttons live in a narrow column
+        # on the right edge of the spinbox.  Vertical policy is
+        # Expanding so the buttons share whatever height the
+        # composite widget has.
+        self.setFixedWidth(24)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+
+    def sizeHint(self) -> QSize:  # noqa: N802 - Qt API
+        return QSize(22, 14)
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt API
+        # Let QToolButton paint the (QSS-styled) background first.
+        super().paintEvent(event)
+        painter = QPainter(self)
+        try:
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            rect = self.rect()
+            cx = rect.width() / 2.0
+            cy = rect.height() / 2.0
+            if self._direction == "up":
+                apex = QPointF(cx, cy - self._HALF_H)
+                base_l = QPointF(cx - self._HALF_W, cy + self._HALF_H)
+                base_r = QPointF(cx + self._HALF_W, cy + self._HALF_H)
+            else:
+                apex = QPointF(cx, cy + self._HALF_H)
+                base_l = QPointF(cx - self._HALF_W, cy - self._HALF_H)
+                base_r = QPointF(cx + self._HALF_W, cy - self._HALF_H)
+            if not self.isEnabled():
+                color = QColor("#b0b8c4")
+            elif self.isDown():
+                color = QColor("#005a9e")
+            else:
+                color = QColor("#4a5a6e")
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(color))
+            painter.drawPolygon(QPolygonF([base_l, base_r, apex]))
+        finally:
+            painter.end()
+
+
+class _StepContainer(QFrame):
+    """Right-side column holding the up and down stepper buttons.
+
+    Provides the visible body, border and rounded right corners so
+    the two buttons read as a single control split in two.  A
+    1px-tall hairline between them visually separates up/down.
+    Sized to the natural width of the two stepper buttons
+    (``24 px`` each) so it never stretches.
+    """
+
+    def __init__(
+        self,
+        up_btn: _StepButton,
+        down_btn: _StepButton,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName("step_container")
+        # Fixed width — the column should be the natural width of
+        # the two stepper buttons.  Height follows the spinbox.
+        self.setFixedWidth(24)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(up_btn)
+        line = QFrame(self)
+        line.setObjectName("step_hairline")
+        line.setFrameShape(QFrame.NoFrame)
+        line.setFixedHeight(1)
+        layout.addWidget(line)
+        layout.addWidget(down_btn)
+
+
+class StepSpinBox(QWidget):
+    """Composite int spinbox with always-visible stepper buttons.
+
+    Exposes a QSpinBox-compatible surface (``value``, ``setValue``,
+    ``setRange``, ``setSingleStep``, ``valueChanged`` signal, etc.)
+    so the Settings code that previously used QSpinBox works
+    unchanged.  Internally uses a QSpinBox with its native steppers
+    hidden (``QAbstractSpinBox.NoButtons``) plus a column of two
+    QToolButton children whose arrows are QPainter polygons.
+    """
+
+    valueChanged = Signal(int)  # type: ignore[assignment]
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Controls")
-        # Height reduced to fit only Start/Stop + Record.
-        self.setFixedSize(280, 210)
-        self.setStyleSheet(LIGHT_TECH_STYLE)
-        self.setWindowFlags(Qt.Tool | Qt.WindowStaysOnTopHint)
+        self.setObjectName("StepSpinBox")
 
-        self._is_running = False
-        self._is_recording = False
+        self._spin = QSpinBox(self)
+        self._spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        self._spin.setObjectName("step_inner")
+        self._spin.setFrame(True)
+        self._spin.valueChanged.connect(self.valueChanged.emit)
 
-        layout = QVBoxLayout(self)
-        layout.setSpacing(10)
+        self._up = _StepButton("up", self)
+        self._down = _StepButton("down", self)
+        self._up.clicked.connect(self._spin.stepUp)
+        self._down.clicked.connect(self._spin.stepDown)
 
-        # Detection
-        det_group = QGroupBox("Detection")
-        det_layout = QHBoxLayout(det_group)
-        det_layout.setSpacing(6)
+        self._container = _StepContainer(self._up, self._down, self)
 
-        self._start_btn = QPushButton("Start")
-        self._start_btn.setStyleSheet(
-            "QPushButton{background:qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #e8f8f0,stop:1 #c8f0d8);border-color:#27ae60;color:#1e8449}"
-            "QPushButton:hover{background:#27ae60;color:#fff}"
-        )
-        self._start_btn.clicked.connect(self.start_requested.emit)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self._spin)
+        layout.addWidget(self._container)
 
-        self._stop_btn = QPushButton("Stop")
-        self._stop_btn.setStyleSheet(
-            "QPushButton{background:qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #fde8e8,stop:1 #f5c6c6);border-color:#e74c3c;color:#c0392b}"
-            "QPushButton:hover{background:#e74c3c;color:#fff}"
-        )
-        self._stop_btn.clicked.connect(self.stop_requested.emit)
-        self._stop_btn.setEnabled(False)
+    # ---- QSpinBox-compatible surface ----
+    def value(self) -> int:
+        return self._spin.value()
 
-        det_layout.addWidget(self._start_btn)
-        det_layout.addWidget(self._stop_btn)
+    def setValue(self, v: int) -> None:  # noqa: N802 - Qt API
+        self._spin.setValue(v)
 
-        # Recording
-        rec_group = QGroupBox("Recording")
-        rec_layout = QHBoxLayout(rec_group)
+    def setRange(self, lo: int, hi: int) -> None:  # noqa: N802 - Qt API
+        self._spin.setRange(lo, hi)
 
-        self._record_btn = QPushButton("Record")
-        self._record_btn.setStyleSheet(
-            "QPushButton{background:qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #fde8e8,stop:1 #f5c6c6);border-color:#e74c3c;color:#c0392b}"
-            "QPushButton:hover{background:#e74c3c;color:#fff}"
-        )
-        self._record_btn.clicked.connect(self._on_record_toggle)
-        self._record_btn.setEnabled(False)
+    def setMinimum(self, lo: int) -> None:  # noqa: N802 - Qt API
+        self._spin.setMinimum(lo)
 
-        rec_layout.addWidget(self._record_btn)
+    def setMaximum(self, hi: int) -> None:  # noqa: N802 - Qt API
+        self._spin.setMaximum(hi)
 
-        layout.addWidget(det_group)
-        layout.addWidget(rec_group)
-        layout.addStretch()
+    def setSingleStep(self, step: int) -> None:  # noqa: N802 - Qt API
+        self._spin.setSingleStep(step)
 
-    def set_running(self, running: bool) -> None:
-        self._is_running = running
-        self._start_btn.setEnabled(not running)
-        self._stop_btn.setEnabled(running)
-        self._record_btn.setEnabled(running)
-        if not running:
-            self._is_recording = False
-            self._record_btn.setText("Record")
+    def setSuffix(self, s: str) -> None:  # noqa: N802 - Qt API
+        self._spin.setSuffix(s)
 
-    def set_recording(self, recording: bool) -> None:
-        self._is_recording = recording
-        self._record_btn.setText("Stop Rec" if recording else "Record")
+    def setPrefix(self, s: str) -> None:  # noqa: N802 - Qt API
+        self._spin.setPrefix(s)
 
-    def _on_record_toggle(self) -> None:
-        if self._is_recording:
-            self.stop_recording_requested.emit()
-        else:
-            self.start_recording_requested.emit()
+    def setSpecialValueText(self, s: str) -> None:  # noqa: N802 - Qt API
+        self._spin.setSpecialValueText(s)
+
+    def setToolTip(self, tip: str) -> None:  # noqa: N802 - Qt API
+        self._spin.setToolTip(tip)
+
+    def setEnabled(self, enabled: bool) -> None:  # noqa: N802 - Qt API
+        super().setEnabled(enabled)
+        self._spin.setEnabled(enabled)
+        self._up.setEnabled(enabled)
+        self._down.setEnabled(enabled)
 
 
-# ─── Stats Dialog ─────────────────────────────────────────────────────
+class StepDoubleSpinBox(QWidget):
+    """Composite float spinbox — same surface as StepSpinBox.
 
-class StatsDialog(QDialog):
-    """Statistics display as a floating dialog."""
+    Uses a QDoubleSpinBox internally; the up/down buttons adjust
+    the value by ``singleStep()`` because ``stepBy`` is not always
+    a stable entry point on PySide6 double spinboxes.
+    """
+
+    valueChanged = Signal(float)  # type: ignore[assignment]
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Statistics")
-        self.setFixedSize(240, 200)
-        self.setStyleSheet(LIGHT_TECH_STYLE)
-        self.setWindowFlags(Qt.Tool | Qt.WindowStaysOnTopHint)
+        self.setObjectName("StepSpinBox")
 
-        layout = QVBoxLayout(self)
-        group = QGroupBox("Live Stats")
-        grid = QGridLayout(group)
-        grid.setSpacing(6)
+        self._spin = QDoubleSpinBox(self)
+        self._spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        self._spin.setObjectName("step_inner")
+        self._spin.setFrame(True)
+        self._spin.valueChanged.connect(self.valueChanged.emit)
 
-        self._fps_val = QLabel("0.0")
-        self._fps_val.setStyleSheet("font-size:18px;font-weight:bold;color:#005a9e")
-        self._fps_lbl = QLabel("FPS")
-        self._fps_lbl.setStyleSheet("font-size:11px;color:#6b7c93")
+        self._up = _StepButton("up", self)
+        self._down = _StepButton("down", self)
+        self._up.clicked.connect(self._step_up)
+        self._down.clicked.connect(self._step_down)
 
-        self._det_val = QLabel("0")
-        self._det_val.setStyleSheet("font-size:18px;font-weight:bold;color:#005a9e")
-        self._det_lbl = QLabel("Detections")
-        self._det_lbl.setStyleSheet("font-size:11px;color:#6b7c93")
+        self._container = _StepContainer(self._up, self._down, self)
 
-        self._rec_val = QLabel("Off")
-        self._rec_val.setStyleSheet("font-size:18px;font-weight:bold;color:#95a5a6")
-        self._rec_lbl = QLabel("Recording")
-        self._rec_lbl.setStyleSheet("font-size:11px;color:#6b7c93")
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self._spin)
+        layout.addWidget(self._container)
 
-        grid.addWidget(self._fps_val, 0, 0)
-        grid.addWidget(self._fps_lbl, 0, 1)
-        grid.addWidget(self._det_val, 1, 0)
-        grid.addWidget(self._det_lbl, 1, 1)
-        grid.addWidget(self._rec_val, 2, 0)
-        grid.addWidget(self._rec_lbl, 2, 1)
+    def _step_up(self) -> None:
+        self._spin.setValue(self._spin.value() + self._spin.singleStep())
 
-        layout.addWidget(group)
+    def _step_down(self) -> None:
+        self._spin.setValue(self._spin.value() - self._spin.singleStep())
 
-    def update_stats(self, fps: float, detections: int, recording: bool) -> None:
-        self._fps_val.setText(f"{fps:.1f}")
-        self._det_val.setText(str(detections))
-        self._rec_val.setText("On" if recording else "Off")
-        self._rec_val.setStyleSheet(
-            f"font-size:18px;font-weight:bold;color:{'#e74c3c' if recording else '#95a5a6'}"
-        )
+    # ---- QDoubleSpinBox-compatible surface ----
+    def value(self) -> float:
+        return self._spin.value()
+
+    def setValue(self, v: float) -> None:  # noqa: N802 - Qt API
+        self._spin.setValue(v)
+
+    def setRange(self, lo: float, hi: float) -> None:  # noqa: N802 - Qt API
+        self._spin.setRange(lo, hi)
+
+    def setMinimum(self, lo: float) -> None:  # noqa: N802 - Qt API
+        self._spin.setMinimum(lo)
+
+    def setMaximum(self, hi: float) -> None:  # noqa: N802 - Qt API
+        self._spin.setMaximum(hi)
+
+    def setSingleStep(self, step: float) -> None:  # noqa: N802 - Qt API
+        self._spin.setSingleStep(step)
+
+    def setDecimals(self, d: int) -> None:  # noqa: N802 - Qt API
+        self._spin.setDecimals(d)
+
+    def setSuffix(self, s: str) -> None:  # noqa: N802 - Qt API
+        self._spin.setSuffix(s)
+
+    def setPrefix(self, s: str) -> None:  # noqa: N802 - Qt API
+        self._spin.setPrefix(s)
+
+    def setToolTip(self, tip: str) -> None:  # noqa: N802 - Qt API
+        self._spin.setToolTip(tip)
+
+    def setEnabled(self, enabled: bool) -> None:  # noqa: N802 - Qt API
+        super().setEnabled(enabled)
+        self._spin.setEnabled(enabled)
+        self._up.setEnabled(enabled)
+        self._down.setEnabled(enabled)
 
 
 # ─── Settings Dialog ─────────────────────────────────────────────────
@@ -1027,53 +1240,51 @@ class SettingsDialog(QDialog):
         layout = QGridLayout(w)
         layout.setSpacing(10)
 
-        layout.addWidget(QLabel("Device Index:"), 0, 0)
-        self._cam_device = QSpinBox()
-        self._cam_device.setRange(0, 99)
-        self._cam_device.setValue(self._config.camera.device_index)
-        layout.addWidget(self._cam_device, 0, 1)
+        # Device selection moved to the camera menu (Tools → Camera).
+        # The Settings page only exposes per-device tuning parameters
+        # so the layout stays focused on detection/notification knobs.
 
-        layout.addWidget(QLabel("Width:"), 1, 0)
-        self._cam_width = QSpinBox()
+        layout.addWidget(QLabel("Width:"), 0, 0)
+        self._cam_width = StepSpinBox()
         self._cam_width.setRange(160, 3840)
         self._cam_width.setSingleStep(160)
         self._cam_width.setValue(self._config.camera.width)
-        layout.addWidget(self._cam_width, 1, 1)
+        layout.addWidget(self._cam_width, 0, 1)
 
-        layout.addWidget(QLabel("Height:"), 2, 0)
-        self._cam_height = QSpinBox()
+        layout.addWidget(QLabel("Height:"), 1, 0)
+        self._cam_height = StepSpinBox()
         self._cam_height.setRange(120, 2160)
         self._cam_height.setSingleStep(120)
         self._cam_height.setValue(self._config.camera.height)
-        layout.addWidget(self._cam_height, 2, 1)
+        layout.addWidget(self._cam_height, 1, 1)
 
-        layout.addWidget(QLabel("FPS:"), 3, 0)
+        layout.addWidget(QLabel("FPS:"), 2, 0)
         self._cam_fps = QSpinBox()
         self._cam_fps.setRange(1, 120)
         self._cam_fps.setValue(self._config.camera.fps)
-        layout.addWidget(self._cam_fps, 3, 1)
+        layout.addWidget(self._cam_fps, 2, 1)
 
-        layout.addWidget(QLabel("Capture Interval (s):"), 4, 0)
-        self._cam_interval = QDoubleSpinBox()
+        layout.addWidget(QLabel("Capture Interval (s):"), 3, 0)
+        self._cam_interval = StepDoubleSpinBox()
         self._cam_interval.setRange(0.1, 60.0)
         self._cam_interval.setSingleStep(0.5)
         self._cam_interval.setValue(self._config.camera.capture_interval)
-        layout.addWidget(self._cam_interval, 4, 1)
+        layout.addWidget(self._cam_interval, 3, 1)
 
-        layout.addWidget(QLabel("Retry Interval (s):"), 5, 0)
-        self._cam_retry_interval = QDoubleSpinBox()
+        layout.addWidget(QLabel("Retry Interval (s):"), 4, 0)
+        self._cam_retry_interval = StepDoubleSpinBox()
         self._cam_retry_interval.setRange(0.5, 60.0)
         self._cam_retry_interval.setSingleStep(0.5)
         self._cam_retry_interval.setValue(self._config.camera.retry_interval)
-        layout.addWidget(self._cam_retry_interval, 5, 1)
+        layout.addWidget(self._cam_retry_interval, 4, 1)
 
-        layout.addWidget(QLabel("Max Retries:"), 6, 0)
+        layout.addWidget(QLabel("Max Retries:"), 5, 0)
         self._cam_max_retries = QSpinBox()
         self._cam_max_retries.setRange(0, 100)
         self._cam_max_retries.setValue(self._config.camera.max_retries)
-        layout.addWidget(self._cam_max_retries, 6, 1)
+        layout.addWidget(self._cam_max_retries, 5, 1)
 
-        layout.setRowStretch(7, 1)
+        layout.setRowStretch(6, 1)
         return w
 
     def _build_detector_tab(self) -> QWidget:
@@ -1092,7 +1303,7 @@ class SettingsDialog(QDialog):
         layout.addWidget(self._det_model, 1, 1)
 
         layout.addWidget(QLabel("Confidence Threshold:"), 2, 0)
-        self._det_threshold = QDoubleSpinBox()
+        self._det_threshold = StepDoubleSpinBox()
         self._det_threshold.setRange(0.01, 1.0)
         self._det_threshold.setSingleStep(0.05)
         self._det_threshold.setValue(self._config.detector.confidence_threshold)
@@ -1104,7 +1315,7 @@ class SettingsDialog(QDialog):
         layout.addWidget(self._det_targets, 3, 1)
 
         layout.addWidget(QLabel("IoU Threshold:"), 4, 0)
-        self._det_iou = QDoubleSpinBox()
+        self._det_iou = StepDoubleSpinBox()
         self._det_iou.setRange(0.01, 1.0)
         self._det_iou.setSingleStep(0.05)
         self._det_iou.setValue(self._config.detector.seg.iou_thres)
@@ -1117,14 +1328,273 @@ class SettingsDialog(QDialog):
         self._det_img_size.setValue(self._config.detector.seg.img_size)
         layout.addWidget(self._det_img_size, 5, 1)
 
+        # ── Provider row with dynamic availability detection ──
+        # The dropdown is populated from the runtime (ort.get_available_providers)
+        # and items that aren't backed by a real provider are disabled with a
+        # tooltip explaining why. A small status label below the combobox
+        # surfaces the same information at a glance, and a ⓘ button opens a
+        # detailed dialog with remediation steps.
         layout.addWidget(QLabel("Provider:"), 6, 0)
-        self._det_provider = QComboBox()
-        self._det_provider.addItems(["cpu", "cuda"])
-        self._det_provider.setCurrentText(self._config.detector.seg.provider)
-        layout.addWidget(self._det_provider, 6, 1)
+        provider_row = QWidget()
+        provider_row_layout = QHBoxLayout(provider_row)
+        provider_row_layout.setContentsMargins(0, 0, 0, 0)
+        provider_row_layout.setSpacing(6)
 
-        layout.setRowStretch(7, 1)
+        self._provider_availability = self._detect_available_providers()
+        provider_model = QStandardItemModel()
+        for name in ("cpu", "cuda"):
+            available, reason = self._provider_availability.get(
+                name, (False, f"Unknown provider: {name}")
+            )
+            item = QStandardItem(name)
+            if not available:
+                item.setEnabled(False)
+                item.setToolTip(reason)
+            provider_model.appendRow(item)
+        self._det_provider = QComboBox()
+        self._det_provider.setModel(provider_model)
+
+        # Reflect the saved config.  If it points at an unavailable provider
+        # we fall back to the first enabled option; the user is informed of
+        # the silent downgrade in a warning dialog shown after the dialog
+        # becomes visible (see QTimer.singleShot below).
+        current_provider = self._config.detector.seg.provider
+        current_available, current_reason = self._provider_availability.get(
+            current_provider, (False, f"Unknown provider: {current_provider}")
+        )
+        if current_available:
+            idx = self._det_provider.findText(current_provider)
+            if idx >= 0:
+                self._det_provider.setCurrentIndex(idx)
+        else:
+            self._det_provider.setCurrentIndex(0)  # cpu
+        self._det_provider.currentIndexChanged.connect(self._on_provider_changed)
+
+        provider_row_layout.addWidget(self._det_provider, 1)
+
+        self._provider_info_btn = QToolButton()
+        self._provider_info_btn.setText("\u24d8")  # ⓘ
+        self._provider_info_btn.setToolTip("Show provider availability details")
+        self._provider_info_btn.setFixedSize(26, 26)
+        self._provider_info_btn.setCursor(Qt.PointingHandCursor)
+        self._provider_info_btn.clicked.connect(self._show_provider_details)
+        provider_row_layout.addWidget(self._provider_info_btn)
+
+        layout.addWidget(provider_row, 6, 1)
+
+        self._provider_status = QLabel()
+        self._provider_status.setWordWrap(True)
+        self._provider_status.setTextFormat(Qt.RichText)
+        self._provider_status.setStyleSheet(
+            "color: #6b7c93; font-size: 11px; padding: 2px 0 4px 0;"
+        )
+        layout.addWidget(self._provider_status, 7, 0, 1, 2)
+
+        self._update_provider_status()
+
+        # Inform the user that the saved provider is not available on this
+        # system.  Queued with delay 0 so the parent dialog is fully realised
+        # before the modal message box is opened (avoids the warning
+        # appearing on top of a half-painted dialog on some platforms).
+        if not current_available:
+            QTimer.singleShot(
+                0,
+                lambda p=current_provider, r=current_reason: self._show_provider_incompatibility(p, r),
+            )
+
+        layout.setRowStretch(8, 1)
         return w
+
+    @staticmethod
+    def _detect_available_providers() -> dict[str, tuple[bool, str]]:
+        """Probe the runtime for ONNX execution providers.
+
+        Returns a mapping ``provider_name -> (available, reason)``.
+
+        Detection tiers:
+          1. Try ``import onnxruntime`` — if it fails, no provider is usable.
+          2. ``CPUExecutionProvider`` is always available when onnxruntime
+             imports successfully.
+          3. ``CUDAExecutionProvider`` is available only when registered
+             by the installed onnxruntime variant.  The reason string
+             distinguishes the CPU-only wheel from a GPU wheel that is
+             missing drivers/companion packages so the user gets an
+             actionable error message.
+        """
+        result: dict[str, tuple[bool, str]] = {}
+
+        try:
+            import onnxruntime as ort  # noqa: F401
+        except Exception as e:
+            return {
+                "cpu": (False, f"onnxruntime is not importable: {e}"),
+                "cuda": (False, "onnxruntime is not installed"),
+            }
+
+        result["cpu"] = (True, "")
+
+        try:
+            available = ort.get_available_providers()
+        except Exception as e:
+            return {
+                "cpu": (True, ""),
+                "cuda": (False, f"Failed to query providers: {e}"),
+            }
+
+        if "CUDAExecutionProvider" in available:
+            result["cuda"] = (True, "")
+            return result
+
+        # CUDA provider missing — try to pinpoint the cause.
+        try:
+            ort_file = (getattr(ort, "__file__", "") or "").lower()
+            is_gpu_wheel = "gpu" in ort_file
+        except Exception:
+            is_gpu_wheel = False
+
+        if is_gpu_wheel:
+            reason = (
+                "onnxruntime-gpu is installed but CUDAExecutionProvider "
+                "is not registered.\n\n"
+                "Likely causes:\n"
+                "  - NVIDIA driver missing or version incompatible with CUDA\n"
+                "  - Companion packages (nvidia-cudnn / nvidia-cublas / "
+                "nvidia-cuda-nvrtc) not installed\n"
+                "  - No CUDA-capable NVIDIA GPU detected on this machine"
+            )
+        else:
+            reason = (
+                "The installed onnxruntime is the CPU-only build, which "
+                "does not include CUDAExecutionProvider.\n\n"
+                "To enable GPU acceleration, install the GPU build and the "
+                "matching NVIDIA companion packages:\n"
+                "  uv pip install --force-reinstall onnxruntime-gpu\n"
+                "  uv sync --extra gpu-cuda-windows"
+            )
+        result["cuda"] = (False, reason)
+        return result
+
+    def _update_provider_status(self) -> None:
+        """Refresh the inline status label under the provider combobox.
+
+        Uses a coloured dot + short text so the availability state is
+        readable at a glance without forcing the user to open the ⓘ dialog.
+        """
+        cuda_avail, cuda_reason = self._provider_availability.get(
+            "cuda", (False, "Unknown")
+        )
+        if cuda_avail:
+            self._provider_status.setText(
+                '<span style="color:#2d9d62; font-size:12px;">●</span> '
+                '<span style="color:#2d9d62;">CUDA available</span> '
+                '<span style="color:#8899aa;">· NVIDIA GPU detected</span>'
+            )
+            return
+
+        # First non-empty line of the reason is short enough for inline use.
+        short = ""
+        for line in (cuda_reason or "").splitlines():
+            stripped = line.strip()
+            if stripped:
+                short = stripped
+                break
+        if not short:
+            short = "CUDA is not available on this system"
+        self._provider_status.setText(
+            f'<span style="color:#c43e3e; font-size:12px;">●</span> '
+            f'<span style="color:#c43e3e;">CUDA not available</span> '
+            f'<span style="color:#8899aa;">· {short}</span>'
+        )
+
+    def _on_provider_changed(self, _index: int) -> None:
+        """Handle provider selection.  Disabled items cannot be chosen via
+        the popup, but if a programmatic change happens we still validate
+        and revert with a clear explanation rather than silently accepting
+        a broken setting.
+        """
+        chosen = self._det_provider.currentText()
+        available, reason = self._provider_availability.get(
+            chosen, (False, f"Unknown provider: {chosen}")
+        )
+        if not available:
+            QMessageBox.warning(
+                self,
+                "Provider Not Available",
+                f"<b>{chosen}</b> is not available on this system.<br><br>"
+                f"<b>Reason:</b><br>{reason.replace(chr(10), '<br>')}<br><br>"
+                f"Please choose a different provider or install the missing "
+                f"dependencies. See the ⓘ button for details.",
+            )
+            # Revert to the first available provider.
+            for i in range(self._det_provider.count()):
+                if self._det_provider.model().item(i).isEnabled():
+                    self._det_provider.blockSignals(True)
+                    self._det_provider.setCurrentIndex(i)
+                    self._det_provider.blockSignals(False)
+                    break
+
+    def _show_provider_details(self) -> None:
+        """Show a detailed QMessageBox describing the current provider
+        availability and concrete remediation steps for any unavailable
+        provider.
+        """
+        avail = self._provider_availability
+        lines: list[str] = []
+        for name in ("cpu", "cuda"):
+            available, _ = avail.get(name, (False, ""))
+            bullet_color = "#2d9d62" if available else "#c43e3e"
+            status = "available" if available else "unavailable"
+            lines.append(
+                f"&nbsp;&nbsp;• <b>{name}</b>: "
+                f"<span style='color:{bullet_color};'>{status}</span>"
+            )
+
+        body = (
+            "<p style='margin:0 0 8px 0;'><b>Provider availability on this system</b></p>"
+            f"<p style='margin:0 0 8px 0;'>{'<br>'.join(lines)}</p>"
+        )
+
+        cuda_avail, cuda_reason = avail.get("cuda", (False, ""))
+        if not cuda_avail:
+            body += (
+                "<p style='margin:8px 0 4px 0;'><b>Why is CUDA unavailable?</b></p>"
+                f"<p style='margin:0; white-space:pre-wrap; color:#2c3e50;'>{cuda_reason}</p>"
+            )
+
+        body += (
+            "<p style='margin:12px 0 0 0; color:#8899aa; font-size:11px;'>"
+            "The provider setting is read when the detector initializes. "
+            "Restart the application for changes to take effect."
+            "</p>"
+        )
+
+        box = QMessageBox(self)
+        box.setWindowTitle("Detector Provider")
+        box.setIcon(QMessageBox.Information)
+        box.setTextFormat(Qt.RichText)
+        box.setText(body)
+        box.setStandardButtons(QMessageBox.Ok)
+        box.exec()
+
+    def _show_provider_incompatibility(
+        self, provider: str, reason: str
+    ) -> None:
+        """Shown once on dialog open when the saved provider isn't usable.
+
+        The combobox has already been reset to the first available
+        option — this message tells the user why and what to do about
+        it.  The user must acknowledge before the dialog continues.
+        """
+        QMessageBox.warning(
+            self,
+            "Provider Not Available",
+            f"Your saved configuration uses <b>{provider}</b>, but this "
+            f"provider is not available on the current system.<br><br>"
+            f"<b>Reason:</b><br>{reason.replace(chr(10), '<br>')}<br><br>"
+            f"The provider has been reset to <b>cpu</b> for this session. "
+            f"Click <b>Save</b> to persist this change, or choose a "
+            f"different provider manually.",
+        )
 
     def _build_notifier_tab(self) -> QWidget:
         w = QWidget()
@@ -1167,7 +1637,7 @@ class SettingsDialog(QDialog):
         layout.addWidget(self._rec_dir, 0, 1)
 
         layout.addWidget(QLabel("FPS:"), 1, 0)
-        self._rec_fps = QDoubleSpinBox()
+        self._rec_fps = StepDoubleSpinBox()
         self._rec_fps.setRange(1.0, 120.0)
         self._rec_fps.setValue(self._config.recorder.fps)
         layout.addWidget(self._rec_fps, 1, 1)
@@ -1187,7 +1657,7 @@ class SettingsDialog(QDialog):
         layout.setSpacing(10)
 
         layout.addWidget(QLabel("Notification Interval (s):"), 0, 0)
-        self._gw_notif_interval = QSpinBox()
+        self._gw_notif_interval = StepSpinBox()
         self._gw_notif_interval.setRange(1, 3600)
         self._gw_notif_interval.setValue(self._config.gateway.notification_interval)
         self._gw_notif_interval.setToolTip("Minimum seconds between same-label notifications to Feishu")
@@ -1198,7 +1668,7 @@ class SettingsDialog(QDialog):
         layout.addWidget(self._gw_snapshot_dir, 1, 1)
 
         layout.addWidget(QLabel("Frame Queue HWM:"), 2, 0)
-        self._gw_hwm = QSpinBox()
+        self._gw_hwm = StepSpinBox()
         self._gw_hwm.setRange(1, 1000)
         self._gw_hwm.setValue(self._config.gateway.frame_queue_hwm)
         layout.addWidget(self._gw_hwm, 2, 1)
@@ -1213,7 +1683,8 @@ class SettingsDialog(QDialog):
         return w
 
     def _on_save(self) -> None:
-        self._config.camera.device_index = self._cam_device.value()
+        # device_index is owned by the camera device menu (Tools → Camera)
+        # and is intentionally not editable from the Settings dialog.
         self._config.camera.width = self._cam_width.value()
         self._config.camera.height = self._cam_height.value()
         self._config.camera.fps = self._cam_fps.value()
@@ -1276,9 +1747,6 @@ class MainWindow(QMainWindow):
         self._config = config
         self._config_path = config_path
         self._logger = logging.getLogger("larksnap.ui.main_window")
-
-        self._control_dialog: ControlDialog | None = None
-        self._stats_dialog: StatsDialog | None = None
 
         self.setStyleSheet(LIGHT_TECH_STYLE)
         self.setWindowTitle("LarkSnap")
@@ -1463,13 +1931,10 @@ class MainWindow(QMainWindow):
         )
 
         # ── View menu ──
+        # Only the HUD toggle remains.  Detection/recording actions are
+        # driven by the camera device menu and the persistent status panel,
+        # and fullscreen is no longer offered.
         view_menu = menu_bar.addMenu("View")
-
-        view_menu.addAction("Controls", self._show_control_dialog, "Ctrl+L")
-        view_menu.addAction("Statistics", self._show_stats_dialog, "Ctrl+I")
-        view_menu.addSeparator()
-        view_menu.addAction("Fullscreen", self._toggle_fullscreen, "F11")
-        view_menu.addSeparator()
         self._hud_action = view_menu.addAction("Show HUD")
         self._hud_action.setCheckable(True)
         self._hud_action.setChecked(True)
@@ -1597,11 +2062,6 @@ class MainWindow(QMainWindow):
         self._preview.clear_frame()
         self.stop_preview()
         self._update_action_states()
-        if self._control_dialog:
-            self._control_dialog.set_running(False)
-            self._control_dialog.set_recording(False)
-        if self._stats_dialog:
-            self._stats_dialog.update_stats(0, 0, False)
 
         self._controller.close_camera()
 
@@ -1616,8 +2076,6 @@ class MainWindow(QMainWindow):
         """Stop detection (camera stays open for preview)."""
         self._controller.stop_detection()
         self._update_action_states()
-        if self._control_dialog:
-            self._control_dialog.set_running(False)
 
     def _on_camera_failed(self, event: Event) -> None:
         """Handle camera failure event — show error dialog."""
@@ -1784,8 +2242,6 @@ class MainWindow(QMainWindow):
         else:
             self._controller.start_recording()
         self._update_action_states()
-        if self._control_dialog:
-            self._control_dialog.set_recording(self._controller.is_recording)
 
     def _on_notification_toggle(self, enabled: bool) -> None:
         """Enable or disable notifications from menu / tray.
@@ -1885,37 +2341,11 @@ class MainWindow(QMainWindow):
         self._tray_enable_notif_action.setEnabled(not notif_on)
         self._tray_disable_notif_action.setEnabled(notif_on)
 
-    def _toggle_fullscreen(self) -> None:
-        if self.isFullScreen():
-            self.showNormal()
-            self.menuBar().show()
-        else:
-            self.menuBar().hide()
-            self.showFullScreen()
-
     def _toggle_hud(self, checked: bool) -> None:
         self._preview._show_hud = checked
         if not checked:
             self._preview._hud_timer.stop()
         self._preview.update()
-
-    def _show_control_dialog(self) -> None:
-        if self._control_dialog is None:
-            self._control_dialog = ControlDialog(self)
-            self._control_dialog.start_requested.connect(self._on_start)
-            self._control_dialog.stop_requested.connect(self._on_stop)
-            self._control_dialog.start_recording_requested.connect(self._on_record_toggle)
-            self._control_dialog.stop_recording_requested.connect(self._on_record_toggle)
-        self._control_dialog.set_running(self._controller.is_running)
-        self._control_dialog.set_recording(self._controller.is_recording)
-        self._control_dialog.show()
-        self._control_dialog.raise_()
-
-    def _show_stats_dialog(self) -> None:
-        if self._stats_dialog is None:
-            self._stats_dialog = StatsDialog(self)
-        self._stats_dialog.show()
-        self._stats_dialog.raise_()
 
     def _show_settings(self) -> None:
         dialog = SettingsDialog(self._config, self._config_path, self)
@@ -1995,22 +2425,6 @@ class MainWindow(QMainWindow):
         # blocked UI thread.
         if self._controller.is_recording_draining:
             self._update_action_states()
-        if self._stats_dialog and self._stats_dialog.isVisible():
-            self._stats_dialog.update_stats(
-                fps=self._controller.producer_fps,
-                detections=self._controller.detection_count,
-                recording=self._controller.is_recording,
-            )
-
-    # ── Keyboard ──
-
-    def keyPressEvent(self, event: QKeyEvent) -> None:
-        key = event.key()
-        if key == Qt.Key_Escape and self.isFullScreen():
-            self.showNormal()
-            self.menuBar().show()
-        else:
-            super().keyPressEvent(event)
 
     # ── Tray & close ──
 

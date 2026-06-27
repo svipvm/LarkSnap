@@ -38,6 +38,7 @@ dependencies = [
     "pyzmq>=26.0.0",
     "numpy<2",
     "opencv-python>=4.8.0",
+    "pyside6>=6.11.1",
 ]
 
 [project.optional-dependencies]
