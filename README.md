@@ -64,8 +64,9 @@ notifier:                # 飞书机器人
   app_id: ""             # 在 https://open.feishu.cn/app 创建应用
   app_secret: ""         # 首次给机器人发送 /start 自动获取 chat_id
 
-gateway:                 # 通知去重与缓冲
-  notification_interval: 30   # 同一类别最短通知间隔（秒）
+gateway:                 # 快照保存与通知节流
+  notification_interval: 30   # 同一类别最短保存/通知间隔（秒），已重命名为快照的 save_interval；保留字段名以便旧配置兼容
+  snapshot_dir: snapshots     # 检测快照保存目录（由快照服务管理）
 
 service:                 # 操作系统服务注册信息
   name: LarkSnap

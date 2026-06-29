@@ -1,13 +1,25 @@
 """Gateway controller — thin orchestrator.
 
-Composes Pipeline, NotificationService, and Recorder.
-Delegates all domain logic to specialized modules.
+Composes Pipeline, SnapshotService, NotificationService, and
+Recorder. Delegates all domain logic to specialized modules.
 
 State machine:
   IDLE        → open_camera()   → CAMERA_ON     (preview running, detection off)
   CAMERA_ON   → start_detection() → DETECTING   (preview running, detection active)
   DETECTING   → stop_detection()  → CAMERA_ON   (preview running, detection off)
   CAMERA_ON/DETECTING → close_camera() → IDLE
+
+Responsibility split:
+  - SnapshotService is invoked whenever the detector is in the
+    DETECTING state, regardless of the notifier's on/off flag.
+  - NotificationService is invoked on every detection event too,
+    but it consults its own enable flag and the per-label
+    cooldown before posting a Feishu message.
+  - The controller is the only component that knows about both
+    services — it threads the snapshot path produced by
+    SnapshotService into the NotificationService's
+    ``handle_results`` call so the chat message can attach the
+    saved image.
 
 Concurrency contract:
   - State is mutated only under ``self._state_lock`` (an RLock so a
@@ -30,6 +42,8 @@ import logging
 import threading
 import time
 from typing import Any, Callable
+
+import numpy as np
 
 from larksnap.adapters.camera.interface import CameraAdapter
 from larksnap.adapters.detector.interface import DetectionResult, DetectorAdapter
@@ -58,6 +72,11 @@ from larksnap.gateway.component_state import (
 from larksnap.gateway.event_bus import Event, EventBus, EventType
 from larksnap.gateway.notification_service import NotificationService, NotificationServiceConfig
 from larksnap.gateway.pipeline import Pipeline, PipelineConfig
+from larksnap.gateway.snapshot_service import (
+    SaveOutcome,
+    SnapshotService,
+    SnapshotServiceConfig,
+)
 from larksnap.utils.exceptions import CameraError, GatewayError
 from larksnap.utils.worker_pool import WorkerPool
 
@@ -194,6 +213,13 @@ class GatewayController:
         # Composed services
         self._pipeline: Pipeline | None = None
         self._notification_service: NotificationService | None = None
+        # Snapshot saving is owned by the *detection* path, not the
+        # notifier. The controller wires it into the result pipeline
+        # and toggles it on ``start_detection`` / ``stop_detection``
+        # so the save activity tracks the detector's on/off state —
+        # not the notifier's. See ``gateway/snapshot_service.py``
+        # for the architectural rationale.
+        self._snapshot_service: SnapshotService | None = None
 
         # Bounded worker pool for offloading blocking I/O. The ZMQ
         # result-subscriber thread (which fires the notification
@@ -273,20 +299,28 @@ class GatewayController:
                 if self._notification_service is not None:
                     self._notification_service._config.message_template = _new
             elif path == "gateway.snapshot_dir":
-                if self._notification_service is not None:
-                    self._notification_service._config.snapshot_dir = _new
+                # The snapshot directory is owned by the snapshot
+                # service (detection path) — propagate the new
+                # path there. The notifier no longer reads this
+                # setting; the snapshot service is the single
+                # source of truth for where local evidence lives.
+                if self._snapshot_service is not None:
+                    self._snapshot_service.config.snapshot_dir = _new
             elif path == "notifier.send_image":
                 if self._notification_service is not None:
                     self._notification_service._config.send_image = _new
-            # gateway.notification_interval is read from
-            # self._config.notification_interval *via* the
-            # NotificationServiceConfig snapshot the controller
-            # built at camera-open time. Mirror the same trick
-            # here so a chat /config set takes effect on the
-            # next detection, not the next camera open.
+            # ``gateway.notification_interval`` is now the
+            # save_interval knob — it lives on the snapshot
+            # service config and indirectly controls the
+            # notification cadence (the notification service
+            # fires only on the frame where the snapshot
+            # service reports a successful save). Mirror the
+            # new value into the snapshot service so a chat
+            # ``/config set`` takes effect on the next
+            # detection, not the next camera open.
             elif path == "gateway.notification_interval":
-                if self._notification_service is not None:
-                    self._notification_service._config.notification_interval = _new
+                if self._snapshot_service is not None:
+                    self._snapshot_service.config.save_interval = float(_new)
         except Exception as e:
             # A subscriber that raises must not abort the chat
             # reply — log and move on. The disk file is already
@@ -612,10 +646,41 @@ class GatewayController:
             )
             self._subscribe(EventType.CAMERA_READ_FAILED, self._on_pipeline_fatal_error)
 
-            # Compose NotificationService
+            # Compose SnapshotService — owns local persistence of
+            # detection evidence. Decoupled from the notifier: it
+            # is enabled whenever the detector is in the started
+            # state, regardless of the notifier's on/off switch.
+            #
+            # The per-class ``save_interval`` (read from
+            # ``gateway.notification_interval`` for config
+            # backwards-compatibility) is the single source of
+            # truth for both the save cadence and the
+            # notification cadence — the notification service
+            # no longer has its own cooldown, so this knob
+            # indirectly throttles the Feishu stream as well.
+            self._snapshot_service = SnapshotService(
+                config=SnapshotServiceConfig(
+                    snapshot_dir=self._config.gateway.snapshot_dir,
+                    save_interval=float(
+                        self._config.gateway.notification_interval
+                    ),
+                    # Mirror the detector state at open time. If
+                    # the user has the detector running on launch,
+                    # ``_restore_runtime_state`` will keep it on;
+                    # otherwise this stays False and the user
+                    # explicitly opts in via ``start_detection``.
+                    enabled=False,
+                ),
+                event_bus=self._event_bus,
+            )
+
+            # Compose NotificationService. The config no longer
+            # carries a cooldown field — the snapshot service's
+            # ``save_interval`` (above) is the single source of
+            # truth for notification frequency. The notifier
+            # fires only on the frame where the snapshot service
+            # reports a successful save.
             notif_config = NotificationServiceConfig(
-                notification_interval=self._config.gateway.notification_interval,
-                snapshot_dir=self._config.gateway.snapshot_dir,
                 message_template=self._config.notifier.message_template,
                 # Defense-in-depth: the notification layer also
                 # filters by target_classes so a detector adapter
@@ -629,7 +694,15 @@ class GatewayController:
                 event_bus=self._event_bus,
                 worker_pool=self._worker_pool,
             )
-            self._pipeline.set_on_results(self._notification_service.handle_results)
+            # The pipeline publishes results through a single
+            # callback. The controller composes it so snapshot
+            # saving (detector-owned) and notification dispatch
+            # (notifier-owned) are invoked in the right order,
+            # with the snapshot service's output threaded into
+            # the notification as a read-only argument. The two
+            # services remain independent: each owns its own
+            # enable flag, cooldown, and worker pool task.
+            self._pipeline.set_on_results(self._on_detection_results)
 
             # Start WebSocket command listener (process-lifetime singleton)
             if self._config.notifier.app_id and self._config.notifier.app_secret:
@@ -885,7 +958,15 @@ class GatewayController:
     # ── Detection Lifecycle ───────────────────────────────────────────
 
     def start_detection(self) -> None:
-        """Start detection (resume the paused pipeline). Camera must be open."""
+        """Start detection (resume the paused pipeline). Camera must be open.
+
+        Toggling detection on also re-enables the snapshot service
+        so local persistence of detection evidence is in lock-step
+        with the detector's on/off state. The notifier is *not*
+        affected — that flag is owned by ``enable_notification``
+        / ``disable_notification`` and may be flipped independently
+        by the user via ``/start`` / ``/stop``.
+        """
         with self._state_lock:
             current = self._state
             if current == GatewayState.IDLE:
@@ -903,6 +984,11 @@ class GatewayController:
 
         if self._pipeline is not None:
             self._pipeline.resume()
+        # Re-enable the snapshot service. The detector is on, so
+        # every detection event should be persisted — regardless
+        # of the notifier's enable flag.
+        if self._snapshot_service is not None:
+            self._snapshot_service.set_enabled(True)
         self._event_bus.publish(Event(type=EventType.DETECTION_STARTED, source="gateway"))
         self._publish_component_state(ComponentKind.DETECTOR)
         self._logger.info("Detection started")
@@ -914,6 +1000,11 @@ class GatewayController:
         recreate the pipeline. Detection is simply paused — the
         camera and preview keep running. This is much cheaper and
         avoids the ZMQ close/reopen cycle that caused re-open bugs.
+
+        Toggling detection off also disables the snapshot service:
+        the user has explicitly said "stop recording evidence" and
+        the controller honours that, even if the camera is still
+        streaming preview frames.
         """
         with self._state_lock:
             current = self._state
@@ -924,6 +1015,10 @@ class GatewayController:
 
         if self._pipeline is not None:
             self._pipeline.pause()
+        # Disable the snapshot service alongside the detector.
+        # No detection runs → no snapshot to save.
+        if self._snapshot_service is not None:
+            self._snapshot_service.set_enabled(False)
         self._event_bus.publish(Event(type=EventType.DETECTION_STOPPED, source="gateway"))
         self._publish_component_state(ComponentKind.DETECTOR)
         self._logger.info("Detection stopped")
@@ -1005,6 +1100,124 @@ class GatewayController:
             self._logger.error("Worker pool shutdown failed: %s", e)
 
     # ── Event handlers ────────────────────────────────────────────────
+
+    def _on_detection_results(
+        self, results: list[DetectionResult], frame: np.ndarray | None
+    ) -> None:
+        """Pipeline result callback: orchestrate snapshot + notification.
+
+        This is the seam where the two responsibility domains meet:
+
+        * **Snapshot saving** is the detector's job. The snapshot
+          service decides, based on its own enable flag and the
+          per-class ``save_interval`` throttle, whether to write
+          a file to disk. The notifier's on/off switch has no
+          influence on this decision.
+        * **Notification dispatch** is the notifier's job. It
+          decides, based on its own enable flag, whether to post
+          a Feishu message — and it **only fires on the frame
+          where the snapshot service reported a successful
+          save** (``SaveOutcome.saved is True``). The
+          per-class ``save_interval`` is therefore the single
+          source of truth for the notification cadence as
+          well.
+
+        Runs on the ZMQ result-subscriber thread; the actual
+        writes are offloaded to the worker pool to keep this
+        thread non-blocking.
+        """
+        # Snapshot the frame copy once: the live ``_latest_frame``
+        # buffer is reused by the next frame, so a worker reading
+        # the original numpy view could observe torn data. The
+        # pipeline hands us a fresh C-contiguous array on each
+        # call, so the copy is cheap.
+        frame_copy: np.ndarray | None = None
+        if frame is not None:
+            frame_copy = np.ascontiguousarray(frame)
+
+        # Snapshot the controller's detector state under the lock
+        # so the worker task sees a consistent view even if the
+        # user toggles detection while the task is in flight.
+        # The snapshot service itself also re-checks ``enabled``
+        # so a late toggle still wins.
+        with self._state_lock:
+            detector_running = self._state == GatewayState.DETECTING
+        snapshot_service = self._snapshot_service
+        notif_service = self._notification_service
+
+        if self._worker_pool is not None:
+            # Offload to the pool so the ZMQ thread returns
+            # immediately. The lambda captures immutable copies
+            # of the inputs, so reordering at the pool is safe.
+            payload = (results, frame_copy, detector_running, snapshot_service, notif_service)
+            queued = self._worker_pool.submit(
+                lambda: self._dispatch_detection(*payload)
+            )
+            if not queued:
+                # Pool is overwhelmed. Drop the frame rather than
+                # block the ZMQ thread on a stuck disk write.
+                self._logger.warning(
+                    "Worker pool full, dropping detection frame"
+                )
+        else:
+            # No pool (test path) — run inline.
+            self._dispatch_detection(
+                results, frame_copy, detector_running, snapshot_service, notif_service
+            )
+
+    def _dispatch_detection(
+        self,
+        results: list[DetectionResult],
+        frame: np.ndarray | None,
+        detector_running: bool,
+        snapshot_service: SnapshotService | None,
+        notif_service: NotificationService | None,
+    ) -> None:
+        """Worker-side helper: save snapshot, then dispatch notification.
+
+        Called on the worker pool (or inline in tests). The order
+        is fixed — snapshot first, notification second — so the
+        notification can include the saved image. The two
+        services remain logically independent:
+
+        * the snapshot path never reads the notifier's state;
+        * the notifier's enable flag never affects the save;
+        * the notifier only fires when the snapshot service
+          reports a successful save, which is what couples the
+          two layers into the same cadence.
+
+        If the detector is paused (``detector_running=False``)
+        the snapshot service short-circuits and returns
+        ``saved=False``; the notifier then has nothing to
+        dispatch. A disabled notifier still receives the call
+        (it is short-circuited inside ``handle_results``) so the
+        local persistence is preserved for when the user
+        re-enables chat.
+        """
+        # The default outcome reflects the "no save" path —
+        # any of the early-out cases below reach the notifier
+        # with ``saved=False`` and the notifier short-circuits.
+        outcome = SaveOutcome(saved=False, path=None)
+
+        if (
+            detector_running
+            and snapshot_service is not None
+            and frame is not None
+        ):
+            # The snapshot service is the single source of
+            # truth for "should a notification go out for
+            # this frame?". The per-class ``save_interval``
+            # throttles both the disk write and the chat
+            # dispatch.
+            outcome = snapshot_service.save_snapshot(frame, results)
+
+        if notif_service is not None:
+            notif_service.handle_results(
+                results,
+                frame,
+                snapshot_path=outcome.path,
+                saved=outcome.saved,
+            )
 
     def _on_pipeline_fatal_error(self, event: Event) -> None:
         """Handle pipeline fatal error — initiate non-blocking close.
@@ -1326,4 +1539,9 @@ class GatewayController:
         self._detector = None
         self._camera = None
         self._recorder = None
+        # The snapshot service has no native ``stop`` / ``release``
+        # path (it is a pure-Python helper) — releasing the
+        # reference is enough to drop any per-camera state. The
+        # next ``open_camera`` builds a fresh instance.
+        self._snapshot_service = None
         self._notification_service = None

@@ -53,7 +53,17 @@ notifier:
   chat_id: ""
 
 gateway:
-  notification_interval: 30 # Minimum seconds between notifications per label
+  # ``notification_interval`` is kept as the legacy name for the
+  # per-class save throttle. Internally it is mapped onto the
+  # snapshot service's ``save_interval`` — the snapshot service
+  # is the single source of truth for both the save cadence and
+  # the notification cadence (the notification service no
+  # longer throttles on its own). Adjusting this knob changes
+  # both: a smaller value produces more frequent snapshots
+  # AND more frequent Feishu messages, because notifications
+  # fire only on the frames where the snapshot service
+  # actually wrote a file. Default 30 s.
+  notification_interval: 30 # Minimum seconds between saves/notifications per label
   snapshot_dir: snapshots   # Directory to save detection snapshots
   frame_queue_hwm: 30       # Frame queue high-water mark (max buffered frames)
   frame_queue_policy: drop_oldest  # Queue overflow policy (drop_oldest / drop_newest / block)

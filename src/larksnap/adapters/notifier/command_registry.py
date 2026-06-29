@@ -178,50 +178,36 @@ def _register_builtins() -> None:
             name="init",
             description="初始化并保存当前 chat_id，后续通知将发送至此会话。",
             syntax="/init",
-            examples=("/init",),
         ),
         CommandSpec(
             name="start",
             description="开启告警通知。检测到目标时将通过 Feishu 推送。",
             syntax="/start",
-            examples=("/start",),
         ),
         CommandSpec(
             name="stop",
             description="关闭告警通知。不会再向 Feishu 推送检测结果。",
             syntax="/stop",
-            examples=("/stop",),
         ),
         CommandSpec(
             name="status",
             description="查询当前网关状态（摄像头、检测、通知开关）。",
             syntax="/status",
-            examples=("/status",),
             aliases=("state",),
         ),
         CommandSpec(
             name="help",
             description="显示本帮助信息，列出所有可用命令及其语法与示例。",
-            syntax="/help [command]",
-            examples=("/help", "/help start"),
+            syntax="/help",
         ),
         CommandSpec(
             name="config",
             description=(
-                "查看或修改 config.yaml 配置。值用 JSON 字面量表示"
-                "（数字、字符串、列表、布尔均可）。修改后立即落盘，"
-                "无需重启即可生效的字段会热生效，需要重启的字段会"
-                "在回复中明确标注。"
+                "查看或修改 config.yaml 配置。"
             ),
             syntax="/config <get|set|show|paths> [path] [json_value]",
             examples=(
-                "/config",
-                "/config paths",
-                "/config get detector.confidence_threshold",
-                "/config set detector.confidence_threshold 0.6",
                 '/config set detector.target_classes ["person","car","dog"]',
-                "/config set gateway.notification_interval 60",
-                "/config show notifier",
             ),
         ),
     )

@@ -1,21 +1,42 @@
-"""Notification service encapsulating cooldown, snapshot, and dispatch logic.
+"""Notification service — save-driven dispatch to Feishu.
 
-Owns its configuration (NotificationServiceConfig) and manages:
-  - Per-label notification cooldown
-  - Snapshot saving (only when notification is actually sent)
-  - Message formatting and dispatch to NotifierAdapter
-  - Defense-in-depth target-class filter (see :func:`handle_results`)
+Owns its configuration (:class:`NotificationServiceConfig`) and
+manages:
+
+* Message formatting and dispatch to ``NotifierAdapter``
+* Defense-in-depth target-class filter (see :py:meth:`handle_results`)
+* The user-controlled enable flag (``/start`` / ``/stop``)
+
+Architectural note — responsibility split:
+
+This service is **not** responsible for saving detection snapshots
+and **not** for deciding *when* a notification should fire.
+Local persistence is owned by
+:class:`larksnap.gateway.snapshot_service.SnapshotService`, and
+the snapshot service is also the only thing that knows the
+per-class ``save_interval`` cooldown. The notification service
+is a *downstream consumer* of the save decision: it dispatches
+a Feishu message only on the frame where the snapshot service
+reports a successful save (``saved=True``). This makes the
+per-class ``save_interval`` the single source of truth for both
+the save cadence and the notification cadence.
+
+As a result, the user can silence Feishu notifications
+(``/stop`` command) without losing the local detection record,
+and re-enable them later (``/start``) to resume chat delivery —
+the local record is independent of the chat dispatch.
 
 Concurrency:
-  - ``handle_results`` is invoked from the ZMQ result-subscriber
-    thread. It is fast and non-blocking: it only checks the
-    notification-enabled flag, evaluates cooldowns, and queues a
-    task on the ``WorkerPool`` for the slow I/O (disk write +
-    HTTP POST).
-  - All actual snapshot saving and ``notifier.send_message`` calls
-    happen on the worker pool. This guarantees the ZMQ consumer
-    thread never blocks on a slow Feishu API call, which would
-    otherwise stall the camera→detection→notification pipeline.
+
+* ``handle_results`` is invoked from the ZMQ result-subscriber
+  thread. It is fast and non-blocking: it only checks the
+  notification-enabled flag, applies the target-class filter,
+  and queues a task on the ``WorkerPool`` for the slow I/O
+  (HTTP POST).
+* All ``notifier.send_message`` calls happen on the worker pool.
+  This guarantees the ZMQ consumer thread never blocks on a slow
+  Feishu API call, which would otherwise stall the
+  camera→detection→notification pipeline.
 """
 
 from __future__ import annotations
@@ -23,12 +44,10 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
-import cv2
 import numpy as np
 
 from larksnap.adapters.detector.interface import (
@@ -63,10 +82,17 @@ class _SafeFormatMap(dict):
 
 @dataclass
 class NotificationServiceConfig:
-    """Configuration owned by NotificationService."""
+    """Configuration owned by NotificationService.
 
-    notification_interval: float = 30.0
-    snapshot_dir: str = "snapshots"
+    The previous ``notification_interval`` cooldown field has
+    been removed: the per-class ``save_interval`` on
+    :class:`larksnap.gateway.snapshot_service.SnapshotServiceConfig`
+    is now the single source of truth for notification
+    frequency. The notification service only adds the
+    user-controlled enable flag and the message template on
+    top of that.
+    """
+
     # Default template uses the multi-class placeholders so a
     # single notification can describe several detections in one
     # frame. ``{labels_summary}`` is ``"person (90%), car (78%)"``;
@@ -88,11 +114,47 @@ class NotificationServiceConfig:
 
 
 class NotificationService:
-    """Encapsulates notification cooldown, snapshot saving, and dispatch.
+    """Save-driven dispatch to the Feishu notifier.
 
-    Usage:
+    The service is a *downstream consumer* of the snapshot
+    service's save decision. It dispatches a Feishu message
+    only on the frame where the snapshot service reports a
+    successful save (``saved=True``). The per-class
+    ``save_interval`` cooldown is owned by the snapshot
+    service; the notification service no longer maintains its
+    own cooldown table. As a result, the user-visible
+    notification frequency is fully controlled by
+    ``SnapshotServiceConfig.save_interval`` (and the notifier's
+    own enable flag).
+
+    The service still owns:
+
+    * the target-class filter (defense in depth — the detector
+      adapter is the primary gatekeeper, but this layer drops
+      anything outside the user-configured set so a future
+      adapter bug cannot leak non-target classes to the user),
+    * the user-controlled enable flag (``/start`` and
+      ``/stop`` flip it),
+    * the message template and the dispatch to the
+      ``NotifierAdapter``.
+
+    Usage (production path)::
+
         service = NotificationService(config, notifier, event_bus, worker_pool)
-        service.handle_results(results, frame)
+        # The orchestrator passes the snapshot service's
+        # ``SaveOutcome`` straight in:
+        outcome = snapshot_service.save_snapshot(frame, results)
+        service.handle_results(
+            results, frame,
+            snapshot_path=outcome.path,
+            saved=outcome.saved,
+        )
+
+    Usage (test path)::
+
+        # Direct callers (unit tests) can opt into dispatch
+        # with ``saved=True`` to skip the save check.
+        service.handle_results([result], frame=frame, saved=True)
     """
 
     def __init__(
@@ -110,11 +172,10 @@ class NotificationService:
         # so the ZMQ thread stays responsive.
         self._worker_pool = worker_pool
         self._logger = logging.getLogger("larksnap.notification_service")
-        # Cooldown table and enabled flag are written from the ZMQ
-        # hot path (read/write of small primitives). A single lock
-        # keeps them consistent without measurable overhead.
-        self._cooldown_lock = threading.Lock()
-        self._last_notification_time: dict[str, float] = {}
+        # The enable flag is read by handlers and written by
+        # ``/start`` / ``/stop`` commands. A single lock keeps the
+        # read-modify-write atomic without measurable overhead.
+        self._enabled_lock = threading.Lock()
         # notification_enabled is also read by handlers, so guard it
         # with the same lock. We expose it via a property to keep
         # the public API stable.
@@ -127,12 +188,12 @@ class NotificationService:
 
     @property
     def is_notification_enabled(self) -> bool:
-        with self._cooldown_lock:
+        with self._enabled_lock:
             return self._notification_enabled
 
     def enable_notification(self) -> None:
         """Enable notification dispatch (triggered by /start command)."""
-        with self._cooldown_lock:
+        with self._enabled_lock:
             current = self._notification_enabled
             self._notification_enabled = True
         if not current:
@@ -146,7 +207,7 @@ class NotificationService:
 
     def disable_notification(self) -> None:
         """Disable notification dispatch (triggered by /stop command)."""
-        with self._cooldown_lock:
+        with self._enabled_lock:
             current = self._notification_enabled
             self._notification_enabled = False
         if current:
@@ -178,117 +239,102 @@ class NotificationService:
         return self._config
 
     def handle_results(
-        self, results: list[DetectionResult], frame: np.ndarray | None = None
+        self,
+        results: list[DetectionResult],
+        frame: np.ndarray | None = None,
+        snapshot_path: str | None = None,
+        saved: bool = False,
     ) -> None:
-        """Process detection results: filter by cooldown, save snapshot, notify.
+        """Process detection results: filter and dispatch on save.
 
-        This is the hot-path entry point. It runs on the ZMQ result
-        subscriber thread, so it must be fast and non-blocking.
-        Snapshot writes and notifier.send_message calls are dispatched
-        to the worker pool (if available) so the ZMQ thread keeps
-        polling the socket.
+        This is the hot-path entry point. It runs on the ZMQ
+        result subscriber thread, so it must be fast and
+        non-blocking. The slow work (HTTP POST to Feishu) is
+        dispatched to the worker pool (if available) so the
+        ZMQ thread keeps polling the socket.
 
-        Defense-in-depth target-class filter: even if a detector
-        adapter forgot to apply the monitoring contract, the
-        notification path will still drop results whose label is
-        not in ``config.target_classes``. An explicit empty list
-        means "monitor nothing" — every result is dropped here.
-        ``None`` means the detector adapter is the sole gatekeeper
-        and this layer forwards whatever arrives.
+        Arguments:
+
+        * ``results`` — detection results from the detector.
+        * ``frame`` — the source frame (kept for backwards
+          compatibility with the previous signature; the
+          service no longer reads it directly — snapshot
+          saving is the snapshot service's job).
+        * ``snapshot_path`` — absolute path of the snapshot
+          the snapshot service wrote for this frame, or
+          ``None`` if no snapshot was produced.
+        * ``saved`` — the snapshot service's verdict for this
+          frame. The notification service **only dispatches
+          when ``saved`` is True**. This is the
+          save→notify coupling: the per-class
+          ``save_interval`` (owned by the snapshot service) is
+          the single source of truth for notification
+          frequency.
+
+        The default for ``saved`` is ``False`` so a direct
+        caller that forgets the argument silently does
+        nothing — that is the safe direction: an accidental
+        notification storm is much worse than a missed one.
+        Test code that wants the legacy "always dispatch"
+        behaviour must pass ``saved=True`` explicitly.
+
+        Defense-in-depth target-class filter: even if a
+        detector adapter forgot to apply the monitoring
+        contract, the notification path will still drop
+        results whose label is not in
+        ``config.target_classes``. An explicit empty list
+        means "monitor nothing" — every result is dropped
+        here. ``None`` means the detector adapter is the
+        sole gatekeeper and this layer forwards whatever
+        arrives.
         """
         if not results:
             return
+        if not saved:
+            # The save→notify coupling: no save means no
+            # notification. The snapshot service is the
+            # single source of truth for "should a
+            # notification go out for this frame?".
+            return
 
-        # Target-class filter at the notification layer. The detector
-        # adapters are expected to apply the same filter, but doing
-        # it again here guarantees the contract even if a future
-        # adapter forgets. Uses the same helper as the adapters so
-        # semantics (case folding, empty-set handling) stay aligned.
+        # Target-class filter at the notification layer. The
+        # detector adapters are expected to apply the same
+        # filter, but doing it again here guarantees the
+        # contract even if a future adapter forgets. Uses
+        # the same helper as the adapters so semantics
+        # (case folding, empty-set handling) stay aligned.
         results = filter_results_by_classes(results, self._config.target_classes)
         if not results:
             return
 
-        with self._cooldown_lock:
+        with self._enabled_lock:
             enabled = self._notification_enabled
-            now = time.time()
-            interval = self._config.notification_interval
-            # Collect results that pass the cooldown check.
-            to_notify: list[DetectionResult] = []
-            for result in results:
-                last_time = self._last_notification_time.get(result.label, 0)
-                if now - last_time < interval:
-                    self._logger.debug(
-                        "Notification for '%s' suppressed (cooldown)", result.label
-                    )
-                    continue
-                to_notify.append(result)
-            # Reserve the cooldown under the same lock as the read
-            # so a parallel handle_results() call doesn't double-fire.
-            for r in to_notify:
-                self._last_notification_time[r.label] = now
-
         if not enabled:
             self._logger.debug("Notification disabled, skipping dispatch")
             return
 
-        if not to_notify:
-            return
+        now = time.time()
 
-        # Offload snapshot save + notifier dispatch to the worker pool.
-        # If no pool is configured (e.g. unit tests), fall back to
-        # the inline path. The inline path is the same code, just
-        # executed on this thread.
+        # Offload the actual dispatch to the worker pool. If
+        # no pool is configured (e.g. unit tests), fall back
+        # to the inline path. The inline path is the same
+        # code, just executed on this thread.
         if self._worker_pool is None:
-            self._dispatch_batch(to_notify, frame, now)
+            self._dispatch_aggregated(results, snapshot_path, now)
         else:
-            # Snapshot the frame once and hand the bytes to the
-            # worker — sharing the same numpy view across threads
-            # would be racy because the ZMQ subscriber overwrites
-            # it on the next frame.
-            frame_copy: np.ndarray | None = None
-            if frame is not None:
-                frame_copy = np.ascontiguousarray(frame)
-            payload = (to_notify, frame_copy, now)
+            payload = (results, snapshot_path, now)
             queued = self._worker_pool.submit(
-                lambda: self._dispatch_batch(*payload)
+                lambda: self._dispatch_aggregated(*payload)
             )
             if not queued:
-                # Queue full: the notifier is overwhelmed. Log and
-                # drop this batch — better than blocking the ZMQ
-                # thread on a slow HTTP retry. The next batch will
-                # be retried.
+                # Queue full: the notifier is overwhelmed.
+                # Log and drop this batch — better than
+                # blocking the ZMQ thread on a slow HTTP
+                # retry. The next batch will be retried.
                 self._logger.warning(
                     "Worker pool full, dropping notification batch of %d result(s)",
-                    len(to_notify),
+                    len(results),
                 )
-
-    def _dispatch_batch(
-        self,
-        to_notify: list[DetectionResult],
-        frame: np.ndarray | None,
-        now: float,
-    ) -> None:
-        """Save one snapshot and dispatch one aggregated notification.
-
-        For multi-class monitoring (the user-configured normal case),
-        a single frame can produce several target detections. We
-        coalesce them into one Feishu message — one image upload,
-        one text — so the user sees the full picture instead of N
-        near-duplicate messages a few milliseconds apart. Single-
-        result batches keep the same shape, so the message template
-        remains a single-record template at the API level.
-
-        This method runs on a worker thread (or, in the test path,
-        directly on the caller). It is allowed to block on I/O.
-        """
-        # Save snapshot once for this batch. Failure here is logged
-        # but doesn't stop the notification from going out — the
-        # snapshot is "best effort".
-        snapshot_path: str | None = None
-        if frame is not None:
-            snapshot_path = self._save_snapshot(frame)
-
-        self._dispatch_aggregated(to_notify, snapshot_path, now)
 
     def _dispatch_aggregated(
         self,
@@ -407,26 +453,15 @@ class NotificationService:
                     source="notification_service",
                 )
             )
-        # Cooldown was already reserved in handle_results() so we
-        # don't need to update it again here. The reservation prevents
-        # duplicate dispatches even if the worker pool reorders tasks.
-
-    def _save_snapshot(self, frame: np.ndarray) -> str | None:
-        """Save a snapshot image to the configured directory."""
-        try:
-            snapshot_dir = Path(self._config.snapshot_dir)
-            snapshot_dir.mkdir(parents=True, exist_ok=True)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"snapshot_{timestamp}.jpg"
-            filepath = snapshot_dir / filename
-            cv2.imwrite(str(filepath), frame)
-            self._logger.info("Snapshot saved: %s", filepath)
-            return str(filepath)
-        except Exception as e:
-            self._logger.error("Failed to save snapshot: %s", e)
-            return None
 
     def reset_cooldown(self) -> None:
-        """Reset all cooldown timers."""
-        with self._cooldown_lock:
-            self._last_notification_time.clear()
+        """Deprecated no-op.
+
+        The notification service used to own a per-label
+        cooldown table; that responsibility now lives on
+        :class:`larksnap.gateway.snapshot_service.SnapshotService`
+        (``SnapshotServiceConfig.save_interval``). The method
+        is kept as a no-op so external callers do not break
+        on import.
+        """
+        return

@@ -29,6 +29,11 @@ class EventType(str, Enum):
 
     FRAME_CAPTURED = "frame_captured"
     DETECTION_COMPLETED = "detection_completed"
+    # Emitted by the snapshot service every time a detection
+    # snapshot is written to disk. ``data`` carries the absolute
+    # file path (str). Fires whether or not the notifier is
+    # enabled — the snapshot is owned by the detection path.
+    SNAPSHOT_SAVED = "snapshot_saved"
     NOTIFICATION_SENT = "notification_sent"
     ERROR_OCCURRED = "error_occurred"
     CAMERA_FAILED = "camera_failed"
