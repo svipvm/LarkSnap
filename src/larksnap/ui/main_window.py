@@ -37,6 +37,7 @@ from PySide6.QtGui import (
     QStandardItemModel,
 )
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QAbstractSpinBox,
     QApplication,
     QCheckBox,
@@ -49,6 +50,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -64,6 +67,7 @@ from PySide6.QtWidgets import (
 )
 
 from larksnap.adapters.detector.interface import DetectionResult
+from larksnap.adapters.detector._seg_ort import COCO_NAMES
 from larksnap.config.loader import save_config
 from larksnap.config.models import AppConfig
 from larksnap.gateway.component_state import (
@@ -1287,6 +1291,32 @@ class SettingsDialog(QDialog):
         layout.setRowStretch(6, 1)
         return w
 
+    def _set_all_target_checks(self, state: Qt.CheckState) -> None:
+        """Flip every class in the targets list to ``state``.
+
+        Used by the "全选" / "清空" buttons. We block ``itemChanged``
+        signals for the duration of the bulk update to avoid the
+        O(N) per-item ``_update_targets_count`` re-fire storm that
+        would otherwise thrash the count label.
+        """
+        self._det_targets.blockSignals(True)
+        try:
+            for i in range(self._det_targets.count()):
+                self._det_targets.item(i).setCheckState(state)
+        finally:
+            self._det_targets.blockSignals(False)
+        # Exactly one update, after the bulk change.
+        self._update_targets_count()
+
+    def _update_targets_count(self, *_args: object) -> None:
+        """Refresh the "已选 N / 80" label above the targets list."""
+        total = self._det_targets.count()
+        checked = sum(
+            1 for i in range(total)
+            if self._det_targets.item(i).checkState() == Qt.Checked
+        )
+        self._det_targets_count.setText(f"已选 {checked} / {total} 类别")
+
     def _build_detector_tab(self) -> QWidget:
         w = QWidget()
         layout = QGridLayout(w)
@@ -1310,9 +1340,55 @@ class SettingsDialog(QDialog):
         layout.addWidget(self._det_threshold, 2, 1)
 
         layout.addWidget(QLabel("Target Classes:"), 3, 0)
-        self._det_targets = QLineEdit(", ".join(self._config.detector.target_classes))
-        self._det_targets.setPlaceholderText("person, car, dog (comma-separated)")
-        layout.addWidget(self._det_targets, 3, 1)
+        # Multi-class monitoring widget: a checkable list populated
+        # with the COCO class catalogue so the user can pick any
+        # combination of classes. The previous single-line text
+        # input was a single-class field in disguise — easy to
+        # typo a class name, and the placeholder "person, car, dog"
+        # only showed three examples. The list makes "monitor
+        # many" the path of least resistance.
+        targets_container = QWidget()
+        targets_layout = QVBoxLayout(targets_container)
+        targets_layout.setContentsMargins(0, 0, 0, 0)
+        targets_layout.setSpacing(4)
+
+        targets_header = QHBoxLayout()
+        self._det_targets_count = QLabel()
+        targets_header.addWidget(self._det_targets_count)
+        targets_header.addStretch(1)
+        self._det_targets_select_all = QPushButton("全选")
+        self._det_targets_clear = QPushButton("清空")
+        self._det_targets_select_all.setFixedWidth(60)
+        self._det_targets_clear.setFixedWidth(60)
+        targets_header.addWidget(self._det_targets_select_all)
+        targets_header.addWidget(self._det_targets_clear)
+        targets_layout.addLayout(targets_header)
+
+        self._det_targets = QListWidget()
+        self._det_targets.setSelectionMode(QAbstractItemView.NoSelection)
+        # Pre-check the configured classes. The match is
+        # case-insensitive because the UI is the user's entry
+        # point and ``Person`` should be honoured just like
+        # ``person``.
+        configured = {c.strip().lower() for c in self._config.detector.target_classes}
+        for name in COCO_NAMES:
+            item = QListWidgetItem(name)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if name in configured else Qt.Unchecked)
+            self._det_targets.addItem(item)
+        self._det_targets.setMaximumHeight(160)
+        targets_layout.addWidget(self._det_targets)
+
+        self._det_targets_select_all.clicked.connect(
+            lambda: self._set_all_target_checks(Qt.Checked)
+        )
+        self._det_targets_clear.clicked.connect(
+            lambda: self._set_all_target_checks(Qt.Unchecked)
+        )
+        self._det_targets.itemChanged.connect(self._update_targets_count)
+
+        layout.addWidget(targets_container, 3, 1)
+        self._update_targets_count()
 
         layout.addWidget(QLabel("IoU Threshold:"), 4, 0)
         self._det_iou = StepDoubleSpinBox()
@@ -1695,8 +1771,14 @@ class SettingsDialog(QDialog):
         self._config.detector.type = self._det_type.currentText()
         self._config.detector.seg.model_path = self._det_model.text()
         self._config.detector.confidence_threshold = self._det_threshold.value()
+        # Read the selected classes from the checkable list. The
+        # order follows ``COCO_NAMES`` (the order the items were
+        # inserted) — that keeps the saved config stable across
+        # edits, even if the user checks/unchecks in arbitrary order.
         self._config.detector.target_classes = [
-            s.strip() for s in self._det_targets.text().split(",") if s.strip()
+            self._det_targets.item(i).text()
+            for i in range(self._det_targets.count())
+            if self._det_targets.item(i).checkState() == Qt.Checked
         ]
         self._config.detector.seg.iou_thres = self._det_iou.value()
         self._config.detector.seg.img_size = self._det_img_size.value()

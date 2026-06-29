@@ -20,6 +20,7 @@ from types import FrameType
 from typing import Callable
 
 from larksnap.config.loader import load_config
+from larksnap.config.service import ConfigService
 from larksnap.gateway.controller import GatewayController
 from larksnap.utils.logger import setup_logger
 
@@ -87,7 +88,16 @@ class ServiceRunner:
         if self._controller_factory is not None:
             self._controller = self._controller_factory()
         else:
-            self._controller = GatewayController(config)
+            # Build a ConfigService so the service-mode gateway
+            # also supports ``/config set`` from the Feishu chat.
+            # Without this the command would still mutate the
+            # in-memory AppConfig but would not persist to disk,
+            # which would be a confusing regression vs. the
+            # Qt / tray modes.
+            config_service = ConfigService(config, config_path=self._config_path)
+            self._controller = GatewayController(
+                config, config_service=config_service
+            )
 
         assert self._controller is not None  # for type checkers
         self._controller.initialize()

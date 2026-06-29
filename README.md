@@ -54,7 +54,7 @@ camera:                  # 摄像头
 detector:                # 检测器（CPU/CUDA 模型分离）
   type: seg              # 当前支持：seg（实例分割）
   confidence_threshold: 0.5
-  target_classes: [person]   # 只对指定类别发通知
+  target_classes: [person, car, dog]   # 多类监控：列出想监控的 COCO 类别
   seg:
     model_path: models/seg-model.onnx
     provider: cpu        # cpu | cuda（需安装对应 extra）

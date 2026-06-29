@@ -4,6 +4,7 @@ Owns its configuration (NotificationServiceConfig) and manages:
   - Per-label notification cooldown
   - Snapshot saving (only when notification is actually sent)
   - Message formatting and dispatch to NotifierAdapter
+  - Defense-in-depth target-class filter (see :func:`handle_results`)
 
 Concurrency:
   - ``handle_results`` is invoked from the ZMQ result-subscriber
@@ -30,7 +31,10 @@ from typing import Any
 import cv2
 import numpy as np
 
-from larksnap.adapters.detector.interface import DetectionResult
+from larksnap.adapters.detector.interface import (
+    DetectionResult,
+    filter_results_by_classes,
+)
 from larksnap.adapters.notifier.interface import NotificationMessage, NotifierAdapter
 from larksnap.gateway.component_state import (
     ComponentKind,
@@ -41,15 +45,46 @@ from larksnap.gateway.event_bus import Event, EventBus, EventType
 from larksnap.utils.worker_pool import WorkerPool
 
 
+class _SafeFormatMap(dict):
+    """Mapping that returns ``"{key}"`` for unknown keys.
+
+    Used by :py:meth:`NotificationService._dispatch_aggregated` so a
+    user template with a typo (``{nonexistent}``) renders as the
+    literal ``{nonexistent}`` in the message instead of crashing
+    the whole notification path. Built-in keys are filled normally.
+    """
+
+    def __missing__(self, key: str) -> str:  # type: ignore[override]
+        # Returning the literal placeholder, not an empty string,
+        # makes the typo obvious to the user when they look at the
+        # message — better than silently swallowing the field.
+        return "{" + str(key) + "}"
+
+
 @dataclass
 class NotificationServiceConfig:
     """Configuration owned by NotificationService."""
 
     notification_interval: float = 30.0
     snapshot_dir: str = "snapshots"
+    # Default template uses the multi-class placeholders so a
+    # single notification can describe several detections in one
+    # frame. ``{labels_summary}`` is ``"person (90%), car (78%)"``;
+    # ``{labels_count}`` is the integer count. Users who want
+    # the legacy single-result view can switch to ``{label}`` /
+    # ``{confidence}`` in their config — those map to the
+    # top-confidence detection.
     message_template: str = (
-        "[LarkSnap] 检测到 {label}，置信度: {confidence:.2%}，时间: {timestamp}"
+        "[LarkSnap] 检测到 {labels_summary}（{labels_count} 个目标），时间: {timestamp}"
     )
+    # The classes the user has configured the detector to monitor.
+    # Used as a defense-in-depth filter in :py:meth:`handle_results`
+    # so a misbehaving / future detector adapter cannot leak
+    # non-target classes into notifications. ``None`` disables the
+    # filter at this layer (the detector adapter is then the sole
+    # gatekeeper). An explicit empty list means "monitor nothing"
+    # — the service will drop every result it receives.
+    target_classes: list[str] | None = None
 
 
 class NotificationService:
@@ -152,7 +187,24 @@ class NotificationService:
         Snapshot writes and notifier.send_message calls are dispatched
         to the worker pool (if available) so the ZMQ thread keeps
         polling the socket.
+
+        Defense-in-depth target-class filter: even if a detector
+        adapter forgot to apply the monitoring contract, the
+        notification path will still drop results whose label is
+        not in ``config.target_classes``. An explicit empty list
+        means "monitor nothing" — every result is dropped here.
+        ``None`` means the detector adapter is the sole gatekeeper
+        and this layer forwards whatever arrives.
         """
+        if not results:
+            return
+
+        # Target-class filter at the notification layer. The detector
+        # adapters are expected to apply the same filter, but doing
+        # it again here guarantees the contract even if a future
+        # adapter forgets. Uses the same helper as the adapters so
+        # semantics (case folding, empty-set handling) stay aligned.
+        results = filter_results_by_classes(results, self._config.target_classes)
         if not results:
             return
 
@@ -216,7 +268,15 @@ class NotificationService:
         frame: np.ndarray | None,
         now: float,
     ) -> None:
-        """Save one snapshot and dispatch one notification per result.
+        """Save one snapshot and dispatch one aggregated notification.
+
+        For multi-class monitoring (the user-configured normal case),
+        a single frame can produce several target detections. We
+        coalesce them into one Feishu message — one image upload,
+        one text — so the user sees the full picture instead of N
+        near-duplicate messages a few milliseconds apart. Single-
+        result batches keep the same shape, so the message template
+        remains a single-record template at the API level.
 
         This method runs on a worker thread (or, in the test path,
         directly on the caller). It is allowed to block on I/O.
@@ -228,32 +288,97 @@ class NotificationService:
         if frame is not None:
             snapshot_path = self._save_snapshot(frame)
 
-        for result in to_notify:
-            self._dispatch_one(result, snapshot_path, now)
+        self._dispatch_aggregated(to_notify, snapshot_path, now)
 
-    def _dispatch_one(
-        self, result: DetectionResult, snapshot_path: str | None, now: float
+    def _dispatch_aggregated(
+        self,
+        results: list[DetectionResult],
+        snapshot_path: str | None,
+        now: float,
     ) -> None:
-        """Format and send a single notification."""
+        """Format and send one notification covering every result.
+
+        The message template can reference either:
+
+        * ``{label}`` / ``{confidence}`` — the top-confidence result
+          (backwards-compatible with the single-class template).
+        * ``{labels_summary}`` — e.g. ``person (90%), car (78%)``,
+          sorted by confidence descending so the most important
+          detection is first.
+        * ``{labels_count}`` — number of distinct detections in
+          the batch.
+        * ``{labels}`` — comma-separated list of labels (no
+          confidences), for templates that want a flat list.
+
+        If the template references none of the multi-class keys,
+        the existing single-result template keeps working — the
+        one-record view is just rendered as the top-confidence
+        detection, which matches the previous behaviour for
+        single-class users.
+        """
+        if not results:
+            return
+
+        # Stable order: most-confident first, then a stable
+        # tiebreaker on label so the rendered message is
+        # reproducible across runs with identical input.
+        ordered = sorted(
+            results,
+            key=lambda r: (-r.confidence, r.label),
+        )
+        top = ordered[0]
+
+        labels_summary = ", ".join(
+            f"{r.label} ({r.confidence:.0%})" for r in ordered
+        )
+        labels_csv = ", ".join(r.label for r in ordered)
+
         timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        message = NotificationMessage(
-            title="LarkSnap Detection Alert",
-            content=self._config.message_template.format(
-                label=result.label,
-                confidence=result.confidence,
+        format_kwargs: dict[str, Any] = {
+            "label": top.label,
+            "confidence": top.confidence,
+            "timestamp": timestamp_str,
+            "snapshot_path": snapshot_path or "",
+            "labels_summary": labels_summary,
+            "labels": labels_csv,
+            "labels_count": len(ordered),
+        }
+        # Templates written before the multi-class keys existed
+        # may use ``str.format`` with a strict spec. To stay
+        # forward-compatible, we render the template with a
+        # fallback mapping: known keys are filled, unknown
+        # keys are left as the literal ``{key}`` in the
+        # message (rather than crashing the whole notification).
+        # This means a typo in a custom template degrades to a
+        # slightly ugly message instead of an outage.
+        try:
+            content = self._config.message_template.format_map(
+                _SafeFormatMap(format_kwargs)
+            )
+        except (KeyError, IndexError):
+            # Defensive: ``str.format_map`` can still raise on
+            # positional placeholders like ``{0}``. Fall back to
+            # the bare legacy set, which only contains known keys.
+            content = self._config.message_template.format(
+                label=top.label,
+                confidence=top.confidence,
                 timestamp=timestamp_str,
                 snapshot_path=snapshot_path or "",
-            ),
-            label=result.label,
-            confidence=result.confidence,
+            )
+
+        message = NotificationMessage(
+            title="LarkSnap Detection Alert",
+            content=content,
+            label=top.label,
+            confidence=top.confidence,
             timestamp=timestamp_str,
             snapshot_path=snapshot_path,
         )
 
         self._logger.info(
-            "DETECTED: %s (confidence: %.2f, time: %s, snapshot: %s)",
-            result.label,
-            result.confidence,
+            "DETECTED (%d): %s (time: %s, snapshot: %s)",
+            len(ordered),
+            labels_summary,
             timestamp_str,
             snapshot_path or "N/A",
         )
@@ -261,13 +386,18 @@ class NotificationService:
         try:
             success = self._notifier.send_message(message)
             if success:
-                self._event_bus.publish(
-                    Event(
-                        type=EventType.NOTIFICATION_SENT,
-                        data=result.label,
-                        source="notification_service",
+                # Publish one event per label so downstream
+                # consumers (stats panel, etc.) still get a
+                # per-class signal. The aggregated message
+                # is purely a presentation concern.
+                for r in ordered:
+                    self._event_bus.publish(
+                        Event(
+                            type=EventType.NOTIFICATION_SENT,
+                            data=r.label,
+                            source="notification_service",
+                        )
                     )
-                )
         except Exception as e:
             self._logger.error("Failed to send notification: %s", e)
             self._event_bus.publish(

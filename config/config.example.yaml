@@ -14,8 +14,14 @@ camera:
 detector:
   type: seg                 # Detector adapter type (seg = instance segmentation)
   confidence_threshold: 0.5 # Minimum confidence to accept a detection
-  target_classes:           # Only notify for these class names
-  - person
+  target_classes:           # Only notify for these class names (COCO 80)
+  - person                  # Multi-class supported — list as many
+  - car                     # as you want to monitor. The same
+  - dog                     # frame can produce several detections
+                            # and they will be aggregated into a
+                            # single Feishu notification. An empty
+                            # list means "monitor nothing" (no
+                            # notifications will be sent).
   seg:
     model_path: models/seg-model.onnx  # Path to ONNX segmentation model
     img_size: 640           # Model input image size
@@ -29,7 +35,16 @@ notifier:
   app_id: ""                # Your Feishu app ID
   app_secret: ""            # Your Feishu app secret
   send_image: true          # Send detection snapshot image with notification
-  message_template: "[LarkSnap] 检测到 {label}，置信度: {confidence:.2%}，时间: {timestamp}"
+  # The default message template aggregates multiple detections
+  # in one frame into a single message. Available placeholders:
+  #   {labels_summary} — "person (90%), car (78%)", sorted by confidence
+  #   {labels_count}   — number of detections in this batch
+  #   {labels}         — comma-separated list of labels (no confidences)
+  #   {label}          — the top-confidence label (legacy single-class)
+  #   {confidence}     — the top-confidence score (legacy single-class)
+  #   {timestamp}      — formatted timestamp
+  #   {snapshot_path}  — path to the saved snapshot image
+  message_template: "[LarkSnap] 检测到 {labels_summary}（{labels_count} 个目标），时间: {timestamp}"
   retry:
     max_retries: 3          # Max retry attempts for API calls
     retry_interval: 5       # Seconds between retries

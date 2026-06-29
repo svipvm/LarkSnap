@@ -7,9 +7,12 @@ start/stop/status to control the gateway.
 
 import json
 import logging
+import re
+import shlex
 import threading
 from collections.abc import Callable
 
+from larksnap.adapters.notifier.command_registry import CommandRegistry
 from larksnap.config.models import NotifierConfig
 from larksnap.utils.exceptions import NotifierError
 
@@ -22,10 +25,45 @@ except ImportError:
     _LARK_SDK_AVAILABLE = False
 
 
-class CommandHandler:
-    """Parsed command from a Feishu message."""
+# Matches an @-mention token at the start of a message. Covers the two
+# shapes Feishu produces in the text payload: ``@_user_1`` (raw open_id
+# form) and ``@bot`` / ``@用户名`` (human-readable form). The token
+# ends at the first whitespace so multi-word display names like
+# ``@Lark Bot`` are stripped in one go.
+_LEADING_MENTION_RE = re.compile(r"^\s*@[\w\-_]+(?:\s+@[\w\-_]+)*\s*")
 
-    __slots__ = ("name", "args", "chat_id", "message_id")
+
+def _strip_at_mention(text: str) -> str:
+    """Remove leading ``@mention`` tokens from a chat message.
+
+    Group-chat payloads in Feishu can include a leading bot mention
+    before the actual command (e.g. ``"@_user_1 /start"``). Removing
+    it up-front lets the rest of the parser operate on a single,
+    well-defined shape.
+    """
+    if not text:
+        return text
+    return _LEADING_MENTION_RE.sub("", text, count=1)
+
+
+class CommandHandler:
+    """Parsed command from a Feishu message.
+
+    Attributes:
+        name: The bare command name (no leading ``/``), lower-cased.
+        args: Positional arguments that followed the command. Whitespace-
+            separated tokens, with support for double-quoted strings
+            (e.g. ``/echo "hello world"`` -> ``args=["hello world"]``).
+        chat_id: The Feishu chat the command originated from. The
+            controller uses this to set the notification target.
+        message_id: The Feishu message id, kept for traceability.
+        unknown: ``True`` when the input looked like a command (started
+            with ``/``) but the name was not in the registry. Lets the
+            controller reply with a "command not found" message instead
+            of silently dropping the user's input.
+    """
+
+    __slots__ = ("name", "args", "chat_id", "message_id", "unknown")
 
     def __init__(
         self,
@@ -33,11 +71,13 @@ class CommandHandler:
         args: list[str] | None = None,
         chat_id: str = "",
         message_id: str = "",
+        unknown: bool = False,
     ) -> None:
         self.name = name
         self.args = args or []
         self.chat_id = chat_id
         self.message_id = message_id
+        self.unknown = unknown
 
 
 class FeishuWSClient:
@@ -48,8 +88,14 @@ class FeishuWSClient:
     dispatches them to a registered callback.
     """
 
-    # Supported commands
-    COMMANDS = ("init", "start", "stop", "status", "help")
+    # Backwards-compatibility alias for callers that introspect the
+    # accepted command set. The authoritative list now lives in
+    # :class:`CommandRegistry`; this tuple is kept in sync at import
+    # time so any code that still does ``FeishuWSClient.COMMANDS``
+    # keeps working.
+    COMMANDS: tuple[str, ...] = tuple(
+        spec.name for spec in CommandRegistry.all_specs()
+    )
 
     def __init__(
         self,
@@ -189,7 +235,12 @@ class FeishuWSClient:
             # Parse command
             cmd = self._parse_command(text, chat_id, message_id)
             if cmd is not None:
-                self._logger.info(
+                # DEBUG, not INFO: the controller already logs
+                # ``Processing command: /<name>`` at INFO, and printing
+                # the full chat_id + arg list here as well would just
+                # double-log every chat interaction. Keep the verbose
+                # trace available for routing / connectivity debugging.
+                self._logger.debug(
                     "Received command: %s %s (chat=%s)",
                     cmd.name,
                     cmd.args,
@@ -203,27 +254,79 @@ class FeishuWSClient:
     def _parse_command(
         self, text: str, chat_id: str, message_id: str
     ) -> CommandHandler | None:
-        """Parse a text message into a CommandHandler.
+        """Parse a text message into a :class:`CommandHandler`.
 
-        Supports formats:
-          - /start
-          - /stop
-          - /status
-          - /help
+        Returns ``None`` when the input is not a command (no leading
+        ``/``). Returns a ``CommandHandler`` with ``unknown=True`` when
+        the input *looks* like a command but the name is not in the
+        registry, so the controller can reply with a helpful error
+        instead of silently dropping the message.
+
+        Accepted shapes (all case-insensitive on the command name):
+
+        * ``/start`` — bare command
+        * ``/start extra args`` — with positional args
+        * ``/start "multi word arg"`` — args with quoted strings
+        * ``@bot /start`` — leading ``@mention`` is stripped (some
+          group-chat payloads prefix the bot mention before the text)
+        * ``/`` or ``/   `` — bare slash with no name is ignored
+
+        Malformed quoting (e.g. unterminated ``"``) falls back to
+        plain whitespace splitting rather than raising, so a single
+        typo in chat can't crash the WS dispatch thread.
         """
-        if not text.startswith("/"):
+        if not text:
             return None
 
-        parts = text.split()
-        cmd_name = parts[0][1:].lower()  # strip leading "/"
-
-        if cmd_name not in self.COMMANDS:
-            self._logger.debug("Unknown command: /%s", cmd_name)
+        # The lark SDK sometimes prefixes the message with the bot
+        # mention in group chats (e.g. "@_user_1 /start"). Strip any
+        # @-prefixed token at the start so the rest of the parser can
+        # operate on the bare command.
+        cleaned = _strip_at_mention(text).strip()
+        if not cleaned.startswith("/"):
             return None
+
+        # Bare "/" with no name — not a command.
+        if cleaned == "/" or set(cleaned) == {"/"}:
+            return None
+
+        # Tokenize. ``shlex`` understands double-quoted args; if the
+        # input is malformed (e.g. unmatched quote) we fall back to a
+        # plain ``split()`` so the dispatch thread never raises.
+        try:
+            tokens = shlex.split(cleaned, posix=True)
+        except ValueError:
+            self._logger.debug(
+                "Falling back to whitespace split for malformed input: %r",
+                cleaned,
+            )
+            tokens = cleaned.split()
+
+        if not tokens:
+            return None
+
+        head = tokens[0]
+        if not head.startswith("/"):
+            return None
+
+        cmd_name = head[1:].strip()
+        if not cmd_name:
+            return None
+        cmd_name = cmd_name.lower()
+
+        if cmd_name not in CommandRegistry.known_names():
+            self._logger.info("Unknown command received: /%s", cmd_name)
+            return CommandHandler(
+                name=cmd_name,
+                args=tokens[1:],
+                chat_id=chat_id,
+                message_id=message_id,
+                unknown=True,
+            )
 
         return CommandHandler(
             name=cmd_name,
-            args=parts[1:],
+            args=tokens[1:],
             chat_id=chat_id,
             message_id=message_id,
         )

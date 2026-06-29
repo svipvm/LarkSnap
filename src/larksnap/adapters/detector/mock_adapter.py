@@ -4,7 +4,12 @@ import time
 
 import numpy as np
 
-from larksnap.adapters.detector.interface import BBox, DetectionResult, DetectorAdapter
+from larksnap.adapters.detector.interface import (
+    BBox,
+    DetectionResult,
+    DetectorAdapter,
+    filter_results_by_classes,
+)
 from larksnap.adapters.registry import detector_registry
 from larksnap.config.models import DetectorConfig
 from larksnap.utils.exceptions import DetectorError
@@ -12,7 +17,14 @@ from larksnap.utils.exceptions import DetectorError
 
 @detector_registry.register("mock")
 class MockDetectorAdapter(DetectorAdapter):
-    """Mock detector adapter that returns simulated detection results."""
+    """Mock detector adapter that returns simulated detection results.
+
+    Honours the monitoring contract: the random results it generates
+    are filtered through :func:`filter_results_by_classes` so only
+    labels present in ``target_classes`` ever leave the adapter. This
+    keeps the mock adapter consistent with the real ``seg`` adapter
+    in tests that exercise the gateway.
+    """
 
     def __init__(self, config: DetectorConfig) -> None:
         """Initialize the mock detector with configuration."""
@@ -55,7 +67,10 @@ class MockDetectorAdapter(DetectorAdapter):
                 )
 
         self._logger.debug("Mock detection returned %d results", len(results))
-        return results
+        # Apply the monitoring contract — the mock and the real
+        # ``seg`` adapter must agree on what counts as a detection
+        # the user actually asked for.
+        return filter_results_by_classes(results, self._config.target_classes)
 
     def unload_model(self) -> None:
         """Simulate unloading the detection model."""

@@ -33,12 +33,15 @@ from typing import Any, Callable
 
 from larksnap.adapters.camera.interface import CameraAdapter
 from larksnap.adapters.detector.interface import DetectionResult, DetectorAdapter
+from larksnap.adapters.detector.seg_adapter import _SegWrapper
+from larksnap.adapters.notifier.command_registry import CommandRegistry, CommandSpec
 from larksnap.adapters.notifier.feishu_adapter import FeishuNotifierAdapter
 from larksnap.adapters.notifier.feishu_ws_client import CommandHandler, FeishuWSClient
 from larksnap.adapters.notifier.interface import NotifierAdapter
 from larksnap.adapters.recorder.video_recorder import VideoRecorderAdapter
 from larksnap.adapters.registry import camera_registry, detector_registry, notifier_registry
 from larksnap.config.models import AppConfig
+from larksnap.config.service import ConfigService
 from larksnap.config.state_persistence import (
     PersistedRuntimeState,
     default_state_path,
@@ -60,6 +63,24 @@ from larksnap.utils.worker_pool import WorkerPool
 
 # Type alias for event handlers (mirrors the one in event_bus.py).
 EventHandler = Callable[["Event"], None]
+
+
+def _render_single_help(spec: CommandSpec) -> str:
+    """Format the help block for a single :class:`CommandSpec`.
+
+    Module-level so it can be reused by tests without instantiating a
+    controller. Mirrors the layout used by
+    :py:meth:`CommandRegistry.render_help` for the full catalogue.
+    """
+    lines = [
+        f"/{spec.name} - {spec.description}",
+        f"  语法: {spec.syntax}",
+    ]
+    if spec.examples:
+        lines.append("  示例: " + "，".join(spec.examples))
+    if spec.aliases:
+        lines.append("  别名: " + "，".join(f"/{a}" for a in spec.aliases))
+    return "\n".join(lines)
 
 
 class GatewayState(enum.Enum):
@@ -122,12 +143,21 @@ class GatewayController:
         config: AppConfig,
         event_bus: EventBus | None = None,
         state_path: "Path | None" = None,
+        config_service: ConfigService | None = None,
     ) -> None:
         # Defer the typing import — Path is in the local module
         # scope, no need to widen the module's typing imports.
         from pathlib import Path as _Path
 
         self._config = config
+        # ``ConfigService`` is the gateway's window onto ``AppConfig``
+        # for the Feishu ``/config`` command. It is optional in
+        # __init__ so the existing tests that build a bare
+        # ``GatewayController`` continue to work; when ``None``
+        # the controller fabricates an in-memory one with no
+        # backing file path, which means ``/config set`` will
+        # still mutate the AppConfig but won't persist to disk.
+        self._config_service = config_service or ConfigService(config)
         self._event_bus = event_bus or EventBus()
         self._logger = logging.getLogger("larksnap.gateway")
         # Where the detector/notifier on/off state is persisted
@@ -201,6 +231,70 @@ class GatewayController:
 
         # Ensure adapter modules are imported
         self._ensure_adapters_registered()
+
+        # Subscribe to live config changes so ``/config set`` can
+        # propagate to the running components (detector target
+        # classes, notification cooldown, message template, etc.).
+        # The unsubscribe function is held for the controller's
+        # lifetime — there's no public close path that needs it,
+        # and the lambda captures only attributes that exist for
+        # the whole process.
+        self._config_unsubscribe = self._config_service.subscribe(
+            self._on_config_changed
+        )
+
+    # ── Config change propagation ────────────────────────────────────
+
+    def _on_config_changed(self, path: str, _old: Any, _new: Any) -> None:
+        """Apply a config change to running components.
+
+        Called by the ``ConfigService`` after every successful
+        ``set``. Only paths that have a live effect are handled
+        here — restart-required paths are persisted to disk by
+        the service and the chat reply tells the user to restart.
+        """
+        try:
+            if path == "detector.target_classes":
+                # Hot-swap the seg detector's monitoring set.
+                # Mock detector reads fresh from config so it
+                # doesn't need a callback.
+                if isinstance(self._detector, _SegWrapper):
+                    self._detector.set_target_classes(_new)
+                # Also keep the notification service's defense-in-depth
+                # filter in sync — the user expects both layers to
+                # reflect the new set.
+                if self._notification_service is not None:
+                    self._notification_service._config.target_classes = list(_new)
+            elif path == "notifier.message_template":
+                # ``NotificationService`` already re-reads its config
+                # on every dispatch, so an in-place mutation is
+                # enough. We touch the attribute explicitly to make
+                # the propagation discoverable in code review.
+                if self._notification_service is not None:
+                    self._notification_service._config.message_template = _new
+            elif path == "gateway.snapshot_dir":
+                if self._notification_service is not None:
+                    self._notification_service._config.snapshot_dir = _new
+            elif path == "notifier.send_image":
+                if self._notification_service is not None:
+                    self._notification_service._config.send_image = _new
+            # gateway.notification_interval is read from
+            # self._config.notification_interval *via* the
+            # NotificationServiceConfig snapshot the controller
+            # built at camera-open time. Mirror the same trick
+            # here so a chat /config set takes effect on the
+            # next detection, not the next camera open.
+            elif path == "gateway.notification_interval":
+                if self._notification_service is not None:
+                    self._notification_service._config.notification_interval = _new
+        except Exception as e:
+            # A subscriber that raises must not abort the chat
+            # reply — log and move on. The disk file is already
+            # updated; the live state will catch up next time the
+            # user touches a related config field.
+            self._logger.warning(
+                "Failed to apply live config change %r: %s", path, e
+            )
 
     # ── State helpers (must be called under _state_lock) ──────────────
 
@@ -523,6 +617,11 @@ class GatewayController:
                 notification_interval=self._config.gateway.notification_interval,
                 snapshot_dir=self._config.gateway.snapshot_dir,
                 message_template=self._config.notifier.message_template,
+                # Defense-in-depth: the notification layer also
+                # filters by target_classes so a detector adapter
+                # that forgets the contract cannot leak non-target
+                # detections to the user.
+                target_classes=list(self._config.detector.target_classes),
             )
             self._notification_service = NotificationService(
                 config=notif_config,
@@ -984,6 +1083,18 @@ class GatewayController:
         if cmd.chat_id and isinstance(self._notifier, FeishuNotifierAdapter):
             self._notifier.set_chat_id(cmd.chat_id)
 
+        # Unknown commands: the parser saw a leading "/" but the name
+        # wasn't in the registry. Reply with a friendly error so the
+        # user knows their input was received (rather than the bot
+        # silently doing nothing) and point them at /help.
+        if cmd.unknown:
+            self._logger.info("Rejecting unknown command: /%s", cmd.name)
+            if isinstance(self._notifier, FeishuNotifierAdapter):
+                self._notifier.send_text(
+                    f"[LarkSnap] 未知指令 /{cmd.name}。发送 /help 查看可用命令。"
+                )
+            return
+
         if cmd.name == "init":
             self._logger.info("Init command received, chat_id obtained")
             self._event_bus.publish(
@@ -1007,16 +1118,191 @@ class GatewayController:
                 status = "running"
             else:
                 status = s.value
-            notif = (
+            notif_on = (
                 "enabled" if (self._notification_service
                               and self._notification_service.notification_enabled)
                 else "disabled"
             )
-            self._logger.info("Gateway status: %s, notification: %s", status, notif)
+            camera = "open" if self.is_camera_open else "closed"
+            targets = ",".join(self._config.detector.target_classes) or "(none)"
+            interval = self._config.gateway.notification_interval
+            self._logger.info("Gateway status: %s, notification: %s", status, notif_on)
+            # Reply to the chat so the user actually sees the result
+            # of ``/status`` — a log line is not a reply.
+            if isinstance(self._notifier, FeishuNotifierAdapter):
+                self._notifier.send_text(
+                    "[LarkSnap] 当前状态\n"
+                    f"  网关: {status}\n"
+                    f"  摄像头: {camera}\n"
+                    f"  通知: {notif_on}\n"
+                    f"  监控类别: {targets}\n"
+                    f"  通知间隔: {interval}s"
+                )
         elif cmd.name == "help":
-            self._logger.info(
-                "Available commands: /init, /start, /stop, /status, /help"
+            # Two modes:
+            #   /help              — render the full command catalogue
+            #   /help <command>    — render just the named command's
+            #                        syntax and examples
+            # The second form is the "drill-down" behaviour suggested
+            # by the ``syntax = "/help [command]"`` in the registry.
+            self._handle_help_command(cmd)
+        elif cmd.name == "config":
+            # /config [get|set|show|paths] [path] [json_value]
+            # The ConfigService handles all the heavy lifting
+            # (path resolution, type coercion, persistence, and
+            # live propagation). The controller is just the
+            # chat-facing dispatcher: turn the result into a
+            # human-readable Feishu reply.
+            self._handle_config_command(cmd)
+
+    def _handle_help_command(self, cmd: CommandHandler) -> None:
+        """Render help text in response to ``/help`` and push it to chat.
+
+        With no args, the full command catalogue is rendered. With one
+        arg, only the matching command's spec is shown (useful when a
+        user forgets the exact syntax of a specific command). Unknown
+        subcommands fall back to the full catalogue with a note.
+        """
+        if isinstance(self._notifier, FeishuNotifierAdapter):
+            self._notifier.send_text(self._render_help(cmd.args))
+
+    def _handle_config_command(self, cmd: CommandHandler) -> None:
+        """Dispatch ``/config`` subcommands and reply to chat.
+
+        The available subcommands are:
+
+        * ``/config`` or ``/config show`` — full config tree
+        * ``/config show <prefix>`` — sub-tree (e.g. ``detector``)
+        * ``/config get <path>`` — single value
+        * ``/config set <path> <json>`` — set + save + live apply
+        * ``/config paths [prefix]`` — flat list of all paths
+
+        Anything else returns a usage hint that lists the
+        subcommands plus a couple of worked examples.
+        """
+        if isinstance(self._notifier, FeishuNotifierAdapter):
+            self._notifier.send_text(self._render_config(cmd.args))
+
+    def _render_config(self, args: list[str]) -> str:
+        """Render the chat reply for a ``/config`` invocation.
+
+        The reply covers every error path explicitly so a user
+        can see *why* their command didn't work, not just that
+        it didn't.
+        """
+        from larksnap.utils.exceptions import ConfigError
+
+        # No args → show the full tree.
+        if not args or args == ["show"]:
+            return self._render_config_show(None)
+        sub = args[0].lower()
+        if sub == "show":
+            prefix = args[1] if len(args) > 1 else None
+            return self._render_config_show(prefix)
+        if sub == "paths":
+            prefix = args[1] if len(args) > 1 else ""
+            return self._render_config_paths(prefix)
+        if sub == "get":
+            if len(args) < 2:
+                return self._render_config_usage()
+            return self._render_config_get(args[1])
+        if sub == "set":
+            if len(args) < 3:
+                return self._render_config_usage()
+            path = args[1]
+            # The JSON value can be more than one token (e.g. a
+            # JSON array ``["person","car"]`` arrives as multiple
+            # tokens because shlex splits on the commas and quotes).
+            # Join with a single space — the service uses
+            # ``json.loads`` to parse the joined string, so a
+            # well-formed JSON literal still round-trips.
+            json_value = " ".join(args[2:])
+            try:
+                old, new, status = self._config_service.set(path, json_value)
+            except ConfigError as e:
+                return f"[LarkSnap] /config set 失败: {e}"
+            marker = "（需重启）" if status == "restart_required" else "（已生效）"
+            saved = self._config_service.config_path
+            saved_str = str(saved) if saved is not None else "<内存>"
+            return (
+                f"[LarkSnap] 已更新: {path} {marker}\n"
+                f"  旧值: {old!r}\n"
+                f"  新值: {new!r}\n"
+                f"  已保存到 {saved_str}"
             )
+        return self._render_config_usage()
+
+    def _render_config_show(self, prefix: str | None) -> str:
+        """Render a sub-tree of the config as ``path = value`` lines."""
+        from larksnap.utils.exceptions import ConfigError
+
+        if prefix is not None:
+            try:
+                self._config_service.get(prefix)
+            except ConfigError as e:
+                return f"[LarkSnap] /config show 失败: {e}"
+        lines = [f"[LarkSnap] 配置视图 {prefix or '<root>'}", ""]
+        for path in self._config_service.list_paths(prefix or ""):
+            try:
+                value = self._config_service.get(path)
+            except Exception:
+                # Don't let one bad leaf block the whole view.
+                continue
+            restart = " [需重启]" if self._config_service.needs_restart(path) else ""
+            lines.append(f"  {path} = {value!r}{restart}")
+        if len(lines) == 2:
+            return f"[LarkSnap] 前缀 {prefix!r} 下没有可显示的配置项"
+        return "\n".join(lines)
+
+    def _render_config_paths(self, prefix: str) -> str:
+        """Render a flat list of all available config paths."""
+        paths = self._config_service.list_paths(prefix)
+        if not paths:
+            return f"[LarkSnap] 前缀 {prefix!r} 下没有匹配的路径"
+        header = f"[LarkSnap] 可配置路径 ({len(paths)}):"
+        body = "\n".join(f"  {p}" for p in paths)
+        return f"{header}\n{body}"
+
+    def _render_config_get(self, path: str) -> str:
+        """Render a single ``get`` reply."""
+        from larksnap.utils.exceptions import ConfigError
+
+        try:
+            value = self._config_service.get(path)
+        except ConfigError as e:
+            return f"[LarkSnap] /config get 失败: {e}"
+        return f"[LarkSnap] {path} = {value!r}"
+
+    def _render_config_usage(self) -> str:
+        """Friendly reminder of the subcommands and a few examples."""
+        return (
+            "[LarkSnap] /config 用法:\n"
+            "  /config                          显示全部配置\n"
+            "  /config show [prefix]            显示子树 (例: /config show detector)\n"
+            "  /config paths [prefix]           列出所有路径\n"
+            "  /config get <path>               获取单个值\n"
+            "  /config set <path> <json>        设置单个值 (例: /config set gateway.notification_interval 60)\n"
+            "  值使用 JSON 字面量: 数字 30、字符串 \"person\"、列表 [\"a\",\"b\"]、布尔 true"
+        )
+
+    def _render_help(self, args: list[str]) -> str:
+        """Build the help text for ``/help [command]``.
+
+        Pure function of ``args`` and the registry, which keeps it
+        trivial to unit-test without spinning up a notifier.
+        """
+        if args:
+            target = args[0].lstrip("/").lower()
+            spec = CommandRegistry.get(target)
+            if spec is not None:
+                return _render_single_help(spec)
+            # Unknown subcommand — surface the full catalogue plus a
+            # short note so the user knows we didn't ignore them.
+            return (
+                f"[LarkSnap] 未找到指令 /{target}。\n\n"
+                + CommandRegistry.render_help()
+            )
+        return CommandRegistry.render_help()
 
     def _release_adapters(self) -> None:
         """Release all adapter resources (best-effort, never raises).

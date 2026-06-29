@@ -10,9 +10,22 @@ Concurrency:
   - The httpx client is shared across threads; httpx is documented
     as thread-safe for the ``Client`` class, so no extra lock is
     needed around ``self._client.post``.
+
+Message content encoding:
+  - Feishu's ``im/v1/messages`` endpoint requires the ``content``
+    field to be a *JSON-encoded string* whose value matches the
+    declared ``msg_type``. Naive f-string interpolation
+    (``f'{{"text": "{text}"}}'``) silently breaks the moment the
+    payload contains a ``"``, a newline, a backslash, or any other
+    character that needs JSON escaping — the resulting string is
+    not valid JSON and the API returns
+    ``ext=content is not a string in json format``. We always
+    build the content envelope with :py:func:`json.dumps` so the
+    serializer handles escaping correctly.
 """
 
 import hashlib
+import json
 import logging
 import threading
 import time
@@ -26,6 +39,19 @@ from larksnap.config.models import NotifierConfig
 from larksnap.utils.exceptions import NotifierError
 
 _FEISHU_BASE_URL = "https://open.feishu.cn/open-apis"
+
+
+def _feishu_content(payload: dict) -> str:
+    """Serialize a Feishu message payload to the JSON string the API wants.
+
+    Feishu's ``im/v1/messages`` endpoint takes a ``content`` field
+    that is *itself* a JSON string. Building it via f-string
+    interpolation is unsafe — any ``"``, ``\\``, or control
+    character in the payload corrupts the outer JSON and the API
+    rejects the request. Routing through :py:func:`json.dumps`
+    keeps the envelope valid no matter what the payload contains.
+    """
+    return json.dumps(payload, ensure_ascii=False)
 
 
 @notifier_registry.register("feishu")
@@ -274,7 +300,7 @@ class FeishuNotifierAdapter(NotifierAdapter):
                     json={
                         "receive_id": self._config.chat_id,
                         "msg_type": "image",
-                        "content": f'{{"image_key": "{image_key}"}}',
+                        "content": _feishu_content({"image_key": image_key}),
                     },
                 )
                 data = resp.json()
@@ -323,7 +349,7 @@ class FeishuNotifierAdapter(NotifierAdapter):
                     json={
                         "receive_id": self._config.chat_id,
                         "msg_type": "text",
-                        "content": f'{{"text": "{content}"}}',
+                        "content": _feishu_content({"text": content}),
                     },
                 )
                 data = resp.json()
@@ -370,7 +396,7 @@ class FeishuNotifierAdapter(NotifierAdapter):
                 json={
                     "receive_id": self._config.chat_id,
                     "msg_type": "text",
-                    "content": f'{{"text": "{content}"}}',
+                    "content": _feishu_content({"text": content}),
                 },
             )
         except httpx.RequestError:
@@ -392,7 +418,7 @@ class FeishuNotifierAdapter(NotifierAdapter):
                 json={
                     "receive_id": self._config.chat_id,
                     "msg_type": "text",
-                    "content": f'{{"text": "{text}"}}',
+                    "content": _feishu_content({"text": text}),
                 },
             )
             data = resp.json()

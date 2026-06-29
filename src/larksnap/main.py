@@ -25,6 +25,7 @@ import signal
 import sys
 
 from larksnap.config.loader import load_config
+from larksnap.config.service import ConfigService
 from larksnap.gateway.controller import GatewayController
 from larksnap.service.platform_utils import (
     ServicePlatform,
@@ -108,7 +109,15 @@ def run_with_qt(config_path: str | None) -> None:
     app.setApplicationName("LarkSnap")
     app.setQuitOnLastWindowClosed(True)
 
-    controller = GatewayController(config)
+    # Build the ConfigService around the loaded AppConfig so the
+    # Feishu ``/config set`` command can mutate state, persist to
+    # the same file ``load_config`` just read, and propagate the
+    # change to the live gateway. ``config_path`` may be ``None``
+    # (e.g. running from a CI test or with the default), in which
+    # case the service still mutates in-memory but skips disk I/O.
+    config_service = ConfigService(config, config_path=config_path)
+
+    controller = GatewayController(config, config_service=config_service)
 
     # Ensure controller.stop() runs even if app.exec() is interrupted
     atexit.register(controller.stop)
@@ -158,7 +167,8 @@ def run_with_tray(config_path: str | None) -> None:
 
     logger.info("Starting LarkSnap (tray mode)...")
 
-    controller = GatewayController(config)
+    config_service = ConfigService(config, config_path=config_path)
+    controller = GatewayController(config, config_service=config_service)
     controller.initialize()
 
     tray = SystemTray(controller)

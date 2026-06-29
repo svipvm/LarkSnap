@@ -2,6 +2,12 @@
 
 Wraps the SegORT inference engine to implement the DetectorAdapter interface,
 providing object detection capabilities using instance segmentation models.
+
+The adapter enforces the *monitoring contract* on top of the raw model
+output: after inference, results are filtered against the configured
+``target_classes`` so that the gateway only ever observes detections
+the user actually asked to monitor. See
+:func:`filter_results_by_classes` for the exact semantics.
 """
 
 from __future__ import annotations
@@ -10,7 +16,12 @@ import logging
 
 import numpy as np
 
-from larksnap.adapters.detector.interface import BBox, DetectionResult, DetectorAdapter
+from larksnap.adapters.detector.interface import (
+    BBox,
+    DetectionResult,
+    DetectorAdapter,
+    filter_results_by_classes,
+)
 from larksnap.adapters.registry import detector_registry
 from larksnap.config.models import DetectorConfig
 from larksnap.utils.exceptions import DetectorError
@@ -62,6 +73,12 @@ class _SegWrapper:
         )
 
         self._coco_names = COCO_NAMES
+        # Cache the monitoring set so ``predict`` can apply the
+        # contract without re-reading the config on every frame.
+        # The list is small and stable for the lifetime of the
+        # process, so caching it is safe and avoids the per-frame
+        # set-construction in :func:`filter_results_by_classes`.
+        self._target_classes: list[str] = list(config.target_classes)
         seg_cfg = config.seg
 
         providers: list[str] = []
@@ -107,4 +124,22 @@ class _SegWrapper:
                 )
             )
 
-        return results
+        # Enforce the monitoring contract: the wrapper only ever
+        # reports detections whose label is in ``target_classes``.
+        # This makes the adapter's behaviour deterministic and
+        # removes the need for the downstream notification path to
+        # guess what the user wanted.
+        return filter_results_by_classes(results, self._target_classes)
+
+    def set_target_classes(self, target_classes: list[str]) -> None:
+        """Hot-swap the monitoring set.
+
+        Called by the controller when ``detector.target_classes``
+        is updated via ``/config set``. The next ``predict()``
+        call uses the new set; the onnx engine itself doesn't
+        need a reload because the monitoring filter is a pure
+        post-processing step on top of the raw model output.
+        """
+        # ``list(...)`` copies so the caller can mutate their
+        # own list afterwards without surprising the adapter.
+        self._target_classes = list(target_classes)
