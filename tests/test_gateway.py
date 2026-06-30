@@ -1,5 +1,4 @@
-import time
-from unittest.mock import MagicMock, patch
+import pytest
 
 from larksnap.config.models import AppConfig
 from larksnap.gateway.controller import GatewayController
@@ -81,6 +80,7 @@ class TestEventBus:
 
 
 class TestGatewayController:
+    @pytest.mark.slow
     def test_initialize_with_mock(self) -> None:
         config = AppConfig()
         config.detector.type = "mock"
@@ -88,40 +88,12 @@ class TestGatewayController:
         controller.initialize()
         controller.stop()
 
-    def test_start_and_stop(self) -> None:
-        config = AppConfig()
-        config.detector.type = "mock"
-        config.camera.device_index = 999
-        controller = GatewayController(config)
-
-        with patch.object(controller, "_create_camera") as mock_create:
-            mock_camera = MagicMock()
-            mock_camera.read_frame.return_value = __import__("numpy").zeros(
-                (480, 640, 3), dtype=__import__("numpy").uint8
-            )
-            mock_create.return_value = mock_camera
-            controller.initialize()
-            controller.start()
-            assert controller.is_running
-            time.sleep(0.5)
-            controller.stop()
-            assert not controller.is_running
-
-    def test_filter_results(self) -> None:
-        from larksnap.adapters.detector.interface import BBox, DetectionResult
-
-        config = AppConfig()
-        config.detector.confidence_threshold = 0.7
-        config.detector.target_classes = ["person"]
-        controller = GatewayController(config)
-
-        results = [
-            DetectionResult(label="person", confidence=0.9, bbox=BBox(0, 0, 100, 100)),
-            DetectionResult(label="car", confidence=0.9, bbox=BBox(0, 0, 100, 100)),
-            DetectionResult(label="person", confidence=0.3, bbox=BBox(0, 0, 100, 100)),
-        ]
-
-        filtered = controller._filter_results(results)
-        assert len(filtered) == 1
-        assert filtered[0].label == "person"
-        assert filtered[0].confidence == 0.9
+    # Note: two legacy tests were removed in the refactor.
+    # - ``test_start_and_stop`` patched ``_create_camera`` (private
+    #   factory that no longer exists on ``GatewayController``).
+    # - ``test_filter_results`` called ``_filter_results`` (the
+    #   filtering logic moved to the detector adapter and the
+    #   notification service; see ``test_target_class_filter`` and
+    #   ``test_snapshot_service`` for the new contract tests).
+    # The replacements are in ``test_controller_lifecycle`` and
+    # ``test_target_class_filter``.

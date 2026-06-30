@@ -231,7 +231,7 @@ class TestNotificationServiceNonBlocking:
     def test_handle_results_returns_immediately_when_worker_pool_used(
         self,
     ) -> None:
-        config = NotificationServiceConfig(notification_interval=0.0)
+        config = NotificationServiceConfig()
         gate = threading.Event()
         notifier_calls: list[str] = []
 
@@ -252,7 +252,13 @@ class TestNotificationServiceNonBlocking:
 
         results = [DetectionResult(label="x", confidence=0.9, bbox=BBox(0, 0, 1, 1))]
         t0 = time.perf_counter()
-        svc.handle_results(results, frame=np.zeros((8, 8, 3), dtype=np.uint8))
+        # ``saved=True`` opts into the dispatch path so the
+        # worker pool is actually exercised (the new
+        # save-driven contract defaults to ``saved=False``
+        # for safety).
+        svc.handle_results(
+            results, frame=np.zeros((8, 8, 3), dtype=np.uint8), saved=True,
+        )
         elapsed = time.perf_counter() - t0
         # Hot path should be sub-100ms. With the previous (inline)
         # design this would be ~500ms because send_message blocks.
