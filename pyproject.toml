@@ -29,7 +29,9 @@ classifiers = [
 ]
 
 # Core dependencies shared by every launch mode.
-# Platform-specific / opt-in features live in the [project.optional-dependencies] table.
+# UI / tray / service launch modes are opt-in via the
+# [project.optional-dependencies] table – this keeps headless service
+# installs free of Qt and lets users pick exactly one inference backend.
 dependencies = [
     "pydantic>=2.0.0",
     "pyyaml>=6.0",
@@ -38,7 +40,6 @@ dependencies = [
     "pyzmq>=26.0.0",
     "numpy<2",
     "opencv-python>=4.8.0",
-    "pyside6>=6.11.1",
 ]
 
 [project.optional-dependencies]
@@ -74,6 +75,9 @@ gpu-cuda-windows = [
 ]
 
 # --- UI launch modes ----------------------------------------------------
+# `qt` pulls in the PySide6 GUI stack. Not installed by default so a
+# headless service install (`uv sync --extra service-windows`) ships
+# without any Qt runtime / wheels.
 qt = [
     "PySide6>=6.7.0",
 ]
@@ -93,6 +97,13 @@ service-windows = [
 service-linux = [
     "sdnotify>=0.3.2; sys_platform == 'linux'",
 ]
+# Cross-platform umbrella: pulls the right per-platform service extra.
+# The sys_platform markers inside the per-platform extras guarantee
+# only one of them actually resolves on a given OS, so this is a
+# safe single-token selector for "I want to run `larksnap service`".
+service = [
+    "larksnap[service-windows,service-linux]",
+]
 
 # --- Developer / test extras --------------------------------------------
 dev = [
@@ -105,18 +116,21 @@ dev = [
 
 # --- Convenience bundles -----------------------------------------------
 # "Everything" set for a typical desktop install on the current platform.
+# The `service` umbrella extra auto-picks `service-windows` or
+# `service-linux` via the sys_platform markers, so a single bundle
+# works on either OS.
 # Users on a particular OS can also do: uv sync --extra gpu-cuda-linux
 all = [
-    "larksnap[cpu,qt,tray]",
+    "larksnap[cpu,qt,tray,service]",
 ]
 all-cuda = [
-    "larksnap[gpu-cuda,qt,tray]",
+    "larksnap[gpu-cuda,qt,tray,service]",
 ]
 all-cuda-linux = [
-    "larksnap[gpu-cuda-linux,qt,tray,service-linux]",
+    "larksnap[gpu-cuda-linux,qt,tray,service]",
 ]
 all-cuda-windows = [
-    "larksnap[gpu-cuda-windows,qt,tray,service-windows]",
+    "larksnap[gpu-cuda-windows,qt,tray,service]",
 ]
 
 [project.scripts]
@@ -134,8 +148,13 @@ Issues = "https://github.com/example/larksnap/issues"
 managed = true
 package = true
 
-# Default dev install: CPU inference + Qt + Tray.
-# Override with `uv sync --extra gpu-cuda-linux` etc.
+# Default dev install: CPU inference only (core + dev extras).
+# Add the launch mode(s) you actually need, e.g.:
+#   uv sync --extra qt              # GUI development
+#   uv sync --extra qt,tray         # GUI + tray
+#   uv sync --extra service         # headless service install (no Qt)
+#   uv sync --extra all             # everything (CPU backend)
+# Override the inference backend with --extra gpu-cuda-{linux,windows}.
 
 # ---------------------------------------------------------------------------
 # Hatchling build configuration

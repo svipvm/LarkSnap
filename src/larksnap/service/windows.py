@@ -154,7 +154,19 @@ def uninstall_windows_service() -> int:
 
 
 def run_windows_service() -> int:
-    """Entry point used by ``python -m larksnap.main service`` on Windows."""
+    """Entry point used by ``python -m larksnap.main service`` on Windows.
+
+    Runs the service body in the foreground — equivalent to what the
+    SCM would do once the service is started, but without requiring
+    the service to be installed first. This makes ``larksnap service``
+    useful for local smoke-testing and CI runs.
+
+    Implementation note: we call :func:`win32serviceutil.DebugService`
+    directly instead of :func:`HandleCommandLine`, because the latter
+    routes the ``debug`` verb through ``LocateSpecificServiceExe`` and
+    refuses to run unless the service is already registered with the
+    SCM. We don't want that pre-condition for a foreground run.
+    """
     if win32serviceutil is None:
         print(
             "pywin32 is required for Windows service. "
@@ -162,5 +174,8 @@ def run_windows_service() -> int:
             file=sys.stderr,
         )
         return 1
-    win32serviceutil.HandleCommandLine(LarkSnapService)
+    # ``DebugService`` instantiates ``cls(argv)`` and ServiceFramework's
+    # constructor reads ``args[0]`` as the service name, so an empty
+    # list raises IndexError. Seed argv with the service name.
+    win32serviceutil.DebugService(LarkSnapService, argv=[LarkSnapService._svc_name_])
     return 0
