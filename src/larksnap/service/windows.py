@@ -126,7 +126,14 @@ if win32serviceutil is not None:
 # Install / uninstall / run helpers (CLI subcommands).
 # ---------------------------------------------------------------------------
 def install_windows_service() -> int:
-    """Register LarkSnap with the Windows SCM."""
+    """Register LarkSnap with the Windows SCM.
+
+    Honors ``config.service.windows_start_type`` (``auto`` /
+    ``manual`` / ``disabled``; ``delayed`` is also accepted by
+    pywin32 and mapped to ``auto`` with a delayed-start hint). When
+    the field is missing or invalid we fall back to ``auto`` to
+    preserve the original ``ServiceConfig`` default.
+    """
     if win32serviceutil is None:
         print(
             "pywin32 is required for Windows service. "
@@ -134,8 +141,31 @@ def install_windows_service() -> int:
             file=sys.stderr,
         )
         return 1
-    win32serviceutil.HandleCommandLine(LarkSnapService, argv=["", "install"])
-    print("LarkSnap service installed successfully.")
+
+    # Read the user-configured start type. load_config() resolves
+    # the same default the rest of the app uses, so running
+    # `larksnap install` from the project root "just works".
+    from larksnap.config.loader import load_config
+
+    config = load_config()
+    startup_raw = (config.service.windows_start_type or "auto").strip().lower()
+    valid = ("auto", "manual", "disabled", "delayed")
+    if startup_raw not in valid:
+        print(
+            f"Invalid service.windows_start_type {startup_raw!r}; "
+            f"expected one of {valid}. Falling back to 'auto'.",
+            file=sys.stderr,
+        )
+        startup_raw = "auto"
+
+    win32serviceutil.HandleCommandLine(
+        LarkSnapService,
+        argv=["", "install", "--startup", startup_raw],
+    )
+    print(
+        f"LarkSnap service installed (start_type={startup_raw}). "
+        f"Start with: sc start {config.service.name}",
+    )
     return 0
 
 
